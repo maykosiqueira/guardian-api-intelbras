@@ -25,7 +25,7 @@ from .const import (
     STATE_MAPPING,
 )
 from .coordinator import GuardianCoordinator
-from .state_logic import compute_unified_state
+from .state_logic import classify_arm_mode, compute_unified_state
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -865,22 +865,12 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
         partition snapshot captured at trigger time.
         """
         snapshot = self.coordinator._pre_trigger_partition_status.get(self._device_id, {})
-        if not snapshot:
-            return None
-        armed_indices = set(snapshot.keys())
-        away_set = set(self._away_partitions)
-        home_set = set(self._home_partitions)
-
-        if self._last_arm_intent == "home" and home_set and armed_indices.issubset(home_set):
-            return "home"
-        if self._last_arm_intent == "away" and away_set and armed_indices.issubset(away_set):
-            return "away"
-        if away_set and armed_indices == away_set:
-            return "away"
-        if home_set and armed_indices == home_set and home_set != away_set:
-            return "home"
-        # Mixed pattern: any partition that's exclusive to away_set tips it to away.
-        return "away" if any(i in away_set and i not in home_set for i in armed_indices) else "home"
+        return classify_arm_mode(
+            armed_indices=snapshot.keys(),
+            away_partitions=self._away_partitions,
+            home_partitions=self._home_partitions,
+            last_arm_intent=self._last_arm_intent,
+        )
 
     @property
     def extra_state_attributes(self):

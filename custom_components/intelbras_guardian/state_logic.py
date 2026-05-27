@@ -122,3 +122,38 @@ def compute_unified_state(
     if mode_counts["away"] > 0:
         return STATE_ARMED_AWAY
     return STATE_ARMED_HOME
+
+
+def classify_arm_mode(
+    *,
+    armed_indices: Iterable[int],
+    away_partitions: Iterable[int],
+    home_partitions: Iterable[int],
+    last_arm_intent: Optional[str],
+) -> Optional[str]:
+    """Classify a set of armed partitions as ``"home"`` / ``"away"`` / ``None``.
+
+    Recovers the home/away mode from a snapshot of *which* partitions are (or
+    were) armed — e.g. the pre-trigger snapshot, since the AMT zeroes the
+    partition byte during an active alarm. This answers "which mode?" rather
+    than "which HA state?" (so it never returns disarmed/triggered), and is
+    shared by the unified entity's ``_compute_pre_trigger_arm_mode``.
+
+    Returns ``None`` when no partition is armed.
+    """
+    armed = set(armed_indices)
+    if not armed:
+        return None
+    away_set = set(away_partitions)
+    home_set = set(home_partitions)
+
+    if last_arm_intent == "home" and home_set and armed.issubset(home_set):
+        return "home"
+    if last_arm_intent == "away" and away_set and armed.issubset(away_set):
+        return "away"
+    if away_set and armed == away_set:
+        return "away"
+    if home_set and armed == home_set and home_set != away_set:
+        return "home"
+    # Mixed: any partition exclusive to the away set tips it to away.
+    return "away" if any(i in away_set and i not in home_set for i in armed) else "home"

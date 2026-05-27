@@ -16,6 +16,7 @@ from state_logic import (
     STATE_ARMING,
     STATE_DISARMED,
     STATE_TRIGGERED,
+    classify_arm_mode,
     compute_unified_state,
 )
 
@@ -63,6 +64,35 @@ def test_compute_unified_state(intent, parts, bypass, trig, expected):
             last_arm_intent=intent,
             bypass_arm_type=bypass,
             partition_arm_modes=MODES,
+        )
+        == expected
+    )
+
+
+# classify_arm_mode: recover home/away from the set of armed partitions
+# (e.g. the pre-trigger snapshot). away_set={0,1}, home_set={0}.
+MODE_CASES = [
+    ("empty_none",            set(),  None,   None),
+    ("both_armed_away",       {0, 1}, None,   "away"),
+    ("only_a_home",           {0},    None,   "home"),
+    ("only_b_away",           {1},    None,   "away"),
+    ("intent_home_a",         {0},    "home", "home"),
+    ("intent_away_both",      {0, 1}, "away", "away"),
+]
+
+
+@pytest.mark.parametrize(
+    "armed,intent,expected",
+    [(c[1], c[2], c[3]) for c in MODE_CASES],
+    ids=[c[0] for c in MODE_CASES],
+)
+def test_classify_arm_mode(armed, intent, expected):
+    assert (
+        classify_arm_mode(
+            armed_indices=armed,
+            away_partitions=AWAY,
+            home_partitions=HOME,
+            last_arm_intent=intent,
         )
         == expected
     )
