@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "custom_components/**"
+      - "tests/**"
+      - ".github/workflows/ci.yaml"
+  pull_request:
+    paths:
+      - "custom_components/**"
+      - "tests/**"
+      - ".github/workflows/ci.yaml"
+
+jobs:
+  lint-test:
+    name: Lint & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tooling
+        run: pip install pytest ruff
+      - name: Ruff (critical errors only)
+        run: ruff check custom_components/ tests/ --select E9,F63,F7,F82
+      - name: Unit tests
+        run: pytest tests/ -q
+
+  hassfest:
+    name: hassfest (validate manifest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master

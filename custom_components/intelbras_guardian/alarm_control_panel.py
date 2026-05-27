@@ -25,6 +25,7 @@ from .const import (
     STATE_MAPPING,
 )
 from .coordinator import GuardianCoordinator
+from .state_logic import compute_unified_state
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -829,74 +830,17 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
            counts.
         """
         device = self.coordinator.get_device(self._device_id)
-        if device and device.get("is_triggered"):
-            return AlarmControlPanelState.TRIGGERED
-
-        partition_states = self._get_partition_states()
-
-        mode_counts = {"away": 0, "home": 0}
-        armed_indices: set[int] = set()
-        for idx, status in partition_states.items():
-            s = str(status).lower() if status else ""
-            if s == "armed_away":
-                mode_counts["away"] += 1
-                armed_indices.add(idx)
-            elif s in ("armed_stay", "armed_home"):
-                mode_counts["home"] += 1
-                armed_indices.add(idx)
-            elif s == "armed":
-                # Generic "armed" without mode suffix — fall back to the
-                # configured intent for this partition (default: away).
-                intent = self._partition_arm_modes.get(str(idx), "away")
-                mode_counts[intent] = mode_counts.get(intent, 0) + 1
-                armed_indices.add(idx)
-
-        away_set = set(self._away_partitions)
-        home_set = set(self._home_partitions)
-
-        # An arm command only "completes" when EVERY partition in the target
-        # set is actually armed (`target ⊆ armed`). Previously this used
-        # `armed ⊆ target`, which let a single armed partition declare the
-        # whole set armed — the root cause of the premature "Ausente".
-        away_complete = bool(away_set) and away_set.issubset(armed_indices)
-        home_complete = bool(home_set) and home_set.issubset(armed_indices)
-
-        # While a bypass decision is pending, an incomplete target set means
-        # the arm has NOT finished — report ARMING instead of DISARMED/ARMED.
-        # Keyed off the bypass's own arm_type (not _last_arm_intent, which
-        # _handle_coordinator_update may have cleared once the central
-        # reported every partition disarmed in the atomic-hold case).
         pending = self._active_bypass()
-        if pending:
-            arm_type = pending.get("arm_type")
-            if arm_type == "away" and not away_complete:
-                return AlarmControlPanelState.ARMING
-            if arm_type == "home" and not home_complete:
-                return AlarmControlPanelState.ARMING
-
-        if not armed_indices:
-            return AlarmControlPanelState.DISARMED
-
-        # User-issued intent wins, but only when its full target set is armed.
-        if self._last_arm_intent == "home" and home_complete:
-            return AlarmControlPanelState.ARMED_HOME
-        if self._last_arm_intent == "away" and away_complete:
-            return AlarmControlPanelState.ARMED_AWAY
-
-        # No usable intent (none recorded, or restored value contradicts the
-        # current armed pattern). Recover the mode from the configured
-        # home/away partition sets before falling back to raw mode counts.
-        if away_set and armed_indices == away_set:
-            return AlarmControlPanelState.ARMED_AWAY
-        if home_set and armed_indices == home_set and home_set != away_set:
-            return AlarmControlPanelState.ARMED_HOME
-
-        # Mixed / partial pattern that doesn't match either configured set
-        # exactly: prefer ARMED_AWAY when any partition reports armed_away
-        # mode (covers a partial bypass mid-arm) otherwise ARMED_HOME.
-        if mode_counts["away"] > 0:
-            return AlarmControlPanelState.ARMED_AWAY
-        return AlarmControlPanelState.ARMED_HOME
+        state_str = compute_unified_state(
+            is_triggered=bool(device and device.get("is_triggered")),
+            partition_states=self._get_partition_states(),
+            away_partitions=self._away_partitions,
+            home_partitions=self._home_partitions,
+            last_arm_intent=self._last_arm_intent,
+            bypass_arm_type=pending.get("arm_type") if pending else None,
+            partition_arm_modes=self._partition_arm_modes,
+        )
+        return AlarmControlPanelState(state_str)
 
     @property
     def state(self) -> str:
