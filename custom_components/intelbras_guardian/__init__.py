@@ -169,7 +169,11 @@ async def _execute_bypass_and_rearm(
         _LOGGER.info(f"Bypass successful, waiting before re-arm...")
         await asyncio.sleep(0.5)
 
-    # Re-arm
+    # Re-arm. The zones were just bypassed, so skip the unified entity's
+    # open-zone pre-check — otherwise the still-cached status would
+    # re-detect them and bounce straight back into the bypass prompt.
+    if hasattr(entity, "_skip_open_zone_check"):
+        entity._skip_open_zone_check = True
     try:
         if arm_type == "away":
             await entity.async_alarm_arm_away()

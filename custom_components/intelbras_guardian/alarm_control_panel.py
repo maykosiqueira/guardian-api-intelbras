@@ -682,6 +682,12 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
         # disarmed.
         self._last_arm_intent: Optional[str] = None
 
+        # When True, the next arm_away/arm_home skips the open-zone
+        # pre-check. Set by the bypass+rearm flow (zones were just
+        # anulled, so re-checking would re-detect them before the next
+        # poll refreshes the cached status and bounce into a loop).
+        self._skip_open_zone_check: bool = False
+
         # Entity attributes
         self._attr_unique_id = f"{device_mac}_unified_alarm"
 
@@ -756,6 +762,51 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
 
         return states
 
+    def _active_bypass(self) -> Optional[dict]:
+        """Return the pending open-zone bypass for this device, if still fresh.
+
+        Set by `_store_bypass_and_notify` when arming detects open zones and
+        the actionable "Ignorar e Armar" notification is sent. Goes stale
+        after `_BYPASS_STALE_TIMEOUT` (same window the bypass+rearm handler
+        uses), so a notification the user never answers eventually releases
+        the ARMING hold. Returns None when absent or stale.
+        """
+        from . import _BYPASS_STALE_TIMEOUT
+
+        pending = self.hass.data.get(DOMAIN, {}).get("pending_bypass", {}).get(self._device_id)
+        if not pending:
+            return None
+        if (time.monotonic() - pending.get("timestamp", 0)) >= _BYPASS_STALE_TIMEOUT:
+            return None
+        return pending
+
+    async def _get_live_open_zones(self) -> list[dict]:
+        """Fetch a fresh status and return zones currently open (not bypassed).
+
+        Used for the atomic open-zone pre-check before arming: we never want
+        to arm part of the away set and leave the rest pending, nor trigger
+        the siren on a partition before the user decides about the open
+        zone(s). Returns an empty list on any failure so arming falls back to
+        the per-partition path instead of being blocked.
+        """
+        try:
+            status = await self.coordinator.client.get_alarm_status_auto(self._device_id)
+        except Exception as e:  # noqa: BLE001 - never block arming on a check error
+            _LOGGER.debug(f"Open-zone pre-check failed for device {self._device_id}: {e}")
+            return []
+        if not status:
+            return []
+        open_zones: list[dict] = []
+        for z in status.get("zones", []):
+            if z.get("is_open") and not z.get("is_bypassed"):
+                idx = z.get("index", 0)
+                open_zones.append({
+                    "index": idx,
+                    "name": z.get("name", f"Zona {idx + 1:02d}"),
+                    "friendly_name": z.get("friendly_name"),
+                })
+        return open_zones
+
     def _compute_state(self) -> AlarmControlPanelState:
         """Compute the unified alarm state from coordinator data.
 
@@ -764,23 +815,24 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
 
         Priority order:
         1. Triggered → TRIGGERED.
-        2. No partitions armed → DISARMED.
-        3. User-issued intent (`_last_arm_intent` set by arm_home/arm_away)
-           wins over mode heuristics. This is what makes pressing "Em Casa"
-           stay ARMED_HOME even when `partition_arm_modes` arms each
-           partition in `armed_away` mode (the central reports armed_away,
-           but the unified intent is HOME).
-        4. Fallback for arming via keypad / after HA restart: any partition
-           in armed_away mode → ARMED_AWAY (covers partial arm_away with
-           pending bypass — the original Bug 4 case).
+        2. Arm waiting on an open-zone decision (pending bypass) and the
+           target set not yet fully armed → ARMING. Keeps the panel from
+           prematurely claiming ARMED_* while the user still has to confirm
+           "Ignorar e Armar" (and nothing — or only part of the set — armed).
+        3. No partitions armed → DISARMED.
+        4. User-issued intent (`_last_arm_intent`), but ONLY when EVERY
+           partition of the target set is armed. A single armed partition no
+           longer declares the whole set armed (that was the root cause of
+           the premature "Ausente" with one partition still disarmed).
+        5. Fallback for arming via keypad / after HA restart: recover the
+           mode from the configured home/away topology, then from raw mode
+           counts.
         """
         device = self.coordinator.get_device(self._device_id)
         if device and device.get("is_triggered"):
             return AlarmControlPanelState.TRIGGERED
 
         partition_states = self._get_partition_states()
-        if not partition_states:
-            return AlarmControlPanelState.DISARMED
 
         mode_counts = {"away": 0, "home": 0}
         armed_indices: set[int] = set()
@@ -799,27 +851,41 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
                 mode_counts[intent] = mode_counts.get(intent, 0) + 1
                 armed_indices.add(idx)
 
+        away_set = set(self._away_partitions)
+        home_set = set(self._home_partitions)
+
+        # An arm command only "completes" when EVERY partition in the target
+        # set is actually armed (`target ⊆ armed`). Previously this used
+        # `armed ⊆ target`, which let a single armed partition declare the
+        # whole set armed — the root cause of the premature "Ausente".
+        away_complete = bool(away_set) and away_set.issubset(armed_indices)
+        home_complete = bool(home_set) and home_set.issubset(armed_indices)
+
+        # While a bypass decision is pending, an incomplete target set means
+        # the arm has NOT finished — report ARMING instead of DISARMED/ARMED.
+        # Keyed off the bypass's own arm_type (not _last_arm_intent, which
+        # _handle_coordinator_update may have cleared once the central
+        # reported every partition disarmed in the atomic-hold case).
+        pending = self._active_bypass()
+        if pending:
+            arm_type = pending.get("arm_type")
+            if arm_type == "away" and not away_complete:
+                return AlarmControlPanelState.ARMING
+            if arm_type == "home" and not home_complete:
+                return AlarmControlPanelState.ARMING
+
         if not armed_indices:
             return AlarmControlPanelState.DISARMED
 
-        # Intent only wins when it is consistent with the partitions the
-        # central is actually reporting as armed. If the user re-armed via
-        # the keypad while HA was offline, a restored intent could
-        # contradict the new armed pattern (e.g., intent="home" but the
-        # central now has every away partition armed) — in that case we
-        # fall through to the topology-based recovery below so the entity
-        # mirrors what the panel really shows, not what HA last issued.
-        away_set = set(self._away_partitions)
-        home_set = set(self._home_partitions)
-        if self._last_arm_intent == "home" and home_set and armed_indices.issubset(home_set):
+        # User-issued intent wins, but only when its full target set is armed.
+        if self._last_arm_intent == "home" and home_complete:
             return AlarmControlPanelState.ARMED_HOME
-        if self._last_arm_intent == "away" and away_set and armed_indices.issubset(away_set):
+        if self._last_arm_intent == "away" and away_complete:
             return AlarmControlPanelState.ARMED_AWAY
 
-        # No usable intent (none recorded, or restored value contradicts
-        # the current armed pattern). Try to recover the mode from the
-        # configured home/away partition sets before falling back to raw
-        # mode counts.
+        # No usable intent (none recorded, or restored value contradicts the
+        # current armed pattern). Recover the mode from the configured
+        # home/away partition sets before falling back to raw mode counts.
         if away_set and armed_indices == away_set:
             return AlarmControlPanelState.ARMED_AWAY
         if home_set and armed_indices == home_set and home_set != away_set:
@@ -964,7 +1030,11 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
         # Trusting the parser's `is_armed`/`is_triggered` flags only — and
         # gating on `optimistic is None` — covers both regressions without
         # false-clearing during transients.
-        if self._last_arm_intent is not None and self._optimistic_state is None:
+        if (
+            self._last_arm_intent is not None
+            and self._optimistic_state is None
+            and not self._active_bypass()
+        ):
             device = self.coordinator.get_device(self._device_id)
             if device:
                 rt = device.get("real_time_status") or {}
@@ -1002,6 +1072,10 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
         _LOGGER.info(f"Unified alarm: Disarming armed partitions for device {self._device_id}")
 
         self._last_arm_intent = None
+        self._skip_open_zone_check = False
+        # Cancel any arm that was held waiting for an open-zone decision so
+        # the panel does not stay stuck in ARMING after the user disarms.
+        self.hass.data.get(DOMAIN, {}).get("pending_bypass", {}).pop(self._device_id, None)
         self._optimistic_state = AlarmControlPanelState.DISARMED
         self.async_write_ha_state()
 
@@ -1171,6 +1245,29 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
         async def _execute_arm_away():
             device_lock = _get_device_command_lock(self._device_id)
             async with device_lock:
+                # Atomic open-zone pre-check: never arm part of the away set
+                # (which would already sound the siren on that partition) and
+                # leave the rest pending. If any zone is open, arm NOTHING,
+                # keep the panel in ARMING and send the actionable bypass
+                # notification. Only "Ignorar e Armar" (bypass+rearm, which
+                # sets _skip_open_zone_check) then arms every partition.
+                skip_check = self._skip_open_zone_check
+                self._skip_open_zone_check = False
+                if not skip_check:
+                    open_zones = await self._get_live_open_zones()
+                    if open_zones:
+                        _LOGGER.info(
+                            f"Arm AWAY held for device {self._device_id}: "
+                            f"{len(open_zones)} open zone(s); nothing armed, "
+                            f"awaiting 'Ignorar e Armar' confirmation"
+                        )
+                        # Record the pending bypass first so _compute_state
+                        # reports ARMING, then drop the optimistic override.
+                        self._store_bypass_and_notify("away", open_zones)
+                        self._optimistic_state = None
+                        self.async_write_ha_state()
+                        return
+
                 all_success = True
                 errors = []
                 open_zones_all = []
