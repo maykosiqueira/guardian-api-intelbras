@@ -33,8 +33,24 @@ jobs:
           custom_components/intelbras_guardian/state_logic.py
           custom_components/intelbras_guardian/api_client.py
           --ignore-missing-imports --follow-imports=skip
-      - name: Unit tests
-        run: pytest tests/ -q
+      - name: Unit tests (pure, no HA)
+        run: pytest tests/ --ignore=tests/integration -q
+
+  integration-test:
+    name: Integration tests (HA mocked)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Home Assistant test deps
+        run: pip install pytest-homeassistant-custom-component
+      # Drives the coordinator/entities with a mocked api_client and a
+      # lightweight MagicMock hass; -p no:homeassistant disables the heavy
+      # autouse fixtures (event loop / socket guard) we don't use.
+      - name: Integration tests
+        run: pytest tests/integration -p no:homeassistant -q
 
   hassfest:
     name: hassfest (validate manifest)
