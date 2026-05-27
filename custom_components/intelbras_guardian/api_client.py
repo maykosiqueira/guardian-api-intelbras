@@ -2,9 +2,11 @@
 import asyncio
 import json
 import logging
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, cast
 import aiohttp
 import async_timeout
+
+from .models import AlarmStatus, ArmResult
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -217,9 +219,12 @@ class GuardianApiClient:
         )
         return result is not None and result.get("success", False)
 
-    async def get_alarm_status_auto(self, device_id: int) -> Optional[Dict[str, Any]]:
+    async def get_alarm_status_auto(self, device_id: int) -> Optional[AlarmStatus]:
         """Get alarm status using saved password (auto-sync)."""
-        return await self._request("GET", f"/api/v1/alarm/{device_id}/status/auto")
+        return cast(
+            Optional[AlarmStatus],
+            await self._request("GET", f"/api/v1/alarm/{device_id}/status/auto"),
+        )
 
     async def get_alarm_status(self, device_id: int, password: str) -> Optional[Dict[str, Any]]:
         """Get alarm status with explicit password."""
@@ -234,25 +239,25 @@ class GuardianApiClient:
         device_id: int,
         partition_id: int,
         mode: str = "away"
-    ) -> Dict[str, Any]:
+    ) -> ArmResult:
         """Arm a partition.
 
         Returns:
-            Dict with 'success' (bool) and optionally 'error' (str) or 'open_zones' (list)
+            ArmResult with 'success' (bool) and optionally 'error' (str) or 'open_zones' (list)
         """
         result = await self._request_with_error(
             "POST",
             f"/api/v1/alarm/{device_id}/arm",
             {"partition_id": partition_id, "mode": mode}
         )
-        return result
+        return cast(ArmResult, result)
 
     async def arm_partitions_multi(
         self,
         device_id: int,
         partition_indices: List[int],
         mode: str = "away"
-    ) -> Dict[str, Any]:
+    ) -> ArmResult:
         """Atomically arm multiple partitions (all-or-nothing).
 
         Uses the server-side /arm-multi endpoint, which pre-checks open zones
@@ -267,11 +272,11 @@ class GuardianApiClient:
             Dict with 'success' (bool); on failure 'error' (str) and
             optionally 'open_zones' (list).
         """
-        return await self._request_with_error(
+        return cast(ArmResult, await self._request_with_error(
             "POST",
             f"/api/v1/alarm/{device_id}/arm-multi",
             {"partitions": partition_indices, "mode": mode}
-        )
+        ))
 
     async def disarm_partition(
         self,
@@ -339,8 +344,8 @@ class GuardianApiClient:
                     # Handle error response - detail can be string or dict
                     detail = response_data.get("detail", {})
                     if isinstance(detail, dict):
-                        error_type = detail.get("error", "")
-                        error_msg = detail.get("message", detail.get("error", "Erro desconhecido"))
+                        error_type = detail.get("error") or ""
+                        error_msg = detail.get("message") or detail.get("error") or "Erro desconhecido"
                         open_zones = detail.get("open_zones", [])
                         # Include error type in the message for better handling
                         if error_type and error_type not in error_msg:

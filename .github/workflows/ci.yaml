@@ -23,9 +23,16 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install tooling
-        run: pip install pytest ruff
+        run: pip install pytest ruff mypy
       - name: Ruff (critical errors only)
         run: ruff check custom_components/ tests/ --select E9,F63,F7,F82
+      - name: Type check (typed modules)
+        run: >-
+          mypy
+          custom_components/intelbras_guardian/models.py
+          custom_components/intelbras_guardian/state_logic.py
+          custom_components/intelbras_guardian/api_client.py
+          --ignore-missing-imports --follow-imports=skip
       - name: Unit tests
         run: pytest tests/ -q
 
