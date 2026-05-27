@@ -1189,14 +1189,61 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
         async def _execute_arm_away():
             device_lock = _get_device_command_lock(self._device_id)
             async with device_lock:
-                # Atomic open-zone pre-check: never arm part of the away set
-                # (which would already sound the siren on that partition) and
-                # leave the rest pending. If any zone is open, arm NOTHING,
-                # keep the panel in ARMING and send the actionable bypass
-                # notification. Only "Ignorar e Armar" (bypass+rearm, which
-                # sets _skip_open_zone_check) then arms every partition.
                 skip_check = self._skip_open_zone_check
                 self._skip_open_zone_check = False
+
+                idxs = [i for i in self._away_partitions if i < len(self._partitions)]
+                target_modes = {
+                    self._partition_arm_modes.get(str(i), "away") for i in idxs
+                }
+
+                # Preferred path: atomic server-side multi-arm. A single
+                # ISECNet session pre-checks open zones and arms all-or-nothing
+                # — no window where one partition arms (siren) before the
+                # open-zone decision. Used when the target partitions share one
+                # mode (the common case). Mixed per-partition modes fall back to
+                # the client-side pre-check + per-partition loop below.
+                if idxs and len(target_modes) == 1:
+                    mode = next(iter(target_modes))
+                    try:
+                        result = await self.coordinator.client.arm_partitions_multi(
+                            self._device_id, idxs, mode=mode
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        result = {"success": False, "error": str(e)}
+
+                    if result.get("success"):
+                        self._optimistic_state = AlarmControlPanelState.ARMED_AWAY
+                        self.async_write_ha_state()
+                        self._schedule_optimistic_clear(AlarmControlPanelState.ARMED_AWAY)
+                        return
+
+                    open_zones = result.get("open_zones") or []
+                    if open_zones:
+                        _LOGGER.info(
+                            f"Arm AWAY held for device {self._device_id}: "
+                            f"{len(open_zones)} open zone(s); nothing armed, "
+                            f"awaiting 'Ignorar e Armar' confirmation"
+                        )
+                        self._store_bypass_and_notify("away", open_zones)
+                        self._optimistic_state = None
+                        self.async_write_ha_state()
+                        return
+
+                    # Non-open-zone failure (connection/busy/etc.)
+                    self._optimistic_state = None
+                    self.async_write_ha_state()
+                    _notify(
+                        self.hass,
+                        "Falha ao armar (Ausente): "
+                        + str(result.get("error", "erro desconhecido")),
+                        title="Erro ao Armar Alarme",
+                        notification_id=f"alarm_error_{self._device_id}_unified",
+                    )
+                    return
+
+                # Fallback (mixed per-partition modes): client-side open-zone
+                # pre-check, then per-partition arm.
                 if not skip_check:
                     open_zones = await self._get_live_open_zones()
                     if open_zones:
@@ -1205,8 +1252,6 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
                             f"{len(open_zones)} open zone(s); nothing armed, "
                             f"awaiting 'Ignorar e Armar' confirmation"
                         )
-                        # Record the pending bypass first so _compute_state
-                        # reports ARMING, then drop the optimistic override.
                         self._store_bypass_and_notify("away", open_zones)
                         self._optimistic_state = None
                         self.async_write_ha_state()

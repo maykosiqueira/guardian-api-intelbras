@@ -40,6 +40,36 @@ class ArmRequest(BaseModel):
     save_password: bool = Field(default=False, description="Save password for future use")
 
 
+class ArmMultiRequest(BaseModel):
+    """Atomic multi-partition arm request model.
+
+    Arms several partitions in a single ISECNet session with an all-or-nothing
+    semantic: a pre-check for open zones is performed BEFORE arming anything, so
+    no partition is armed if any relevant zone is open.
+    """
+    partitions: List[int] = Field(..., min_length=1, description="Partition indices (0-based) to arm atomically")
+    mode: ArmMode = Field(default=ArmMode.AWAY, description="Arm mode: away (total) or home (stay)")
+    password: Optional[str] = Field(None, min_length=4, max_length=6, description="Alarm panel password (4-6 digits). If not provided, uses saved password.")
+    save_password: bool = Field(default=False, description="Save password for future use")
+
+
+class PartitionArmResult(BaseModel):
+    """Result of arming a single partition within an atomic multi-arm operation."""
+    partition_index: int = Field(..., description="Partition index (0-based)")
+    success: bool = Field(..., description="Whether this partition was armed")
+    message: str = Field(..., description="Per-partition operation message")
+
+
+class ArmMultiResponse(BaseModel):
+    """Atomic multi-partition arm response model."""
+    success: bool = Field(..., description="Whether ALL target partitions were armed")
+    device_id: int = Field(..., description="Device ID")
+    partitions: List[int] = Field(..., description="Partition indices that were targeted")
+    new_status: Optional[str] = Field(None, description="New status applied to all partitions")
+    message: str = Field(..., description="Operation message")
+    results: List[PartitionArmResult] = Field(default_factory=list, description="Per-partition results")
+
+
 class DisarmRequest(BaseModel):
     """Disarm request model."""
     partition_id: Optional[int] = Field(None, description="Partition ID to disarm (None = all partitions)")
@@ -275,6 +305,41 @@ async def _get_open_zones(
     except Exception as e:
         logger.error(f"Error getting open zones: {e}")
 
+    return open_zones
+
+
+async def _open_zones_from_status(device_id: int, status) -> List[OpenZoneInfo]:
+    """Build the OpenZoneInfo list from an already-fetched AlarmStatus.
+
+    Used by the atomic multi-arm endpoint so the pre-check can reuse a single
+    status read (no extra connection / no disconnect).
+
+    IMPORTANT: The ISECNet status does NOT expose a zone->partition mapping
+    (zones are a flat open/triggered bitfield). Therefore the pre-check
+    considers ALL open zones, which is correct for the "Ausente"/away case
+    that arms every partition. See module-level docs on arm-multi.
+
+    Args:
+        device_id: Device ID
+        status: AlarmStatus returned by isecnet_client.get_status
+
+    Returns:
+        List of open zones with their friendly names
+    """
+    open_zones: List[OpenZoneInfo] = []
+    try:
+        friendly_names = await state_manager.get_all_zone_friendly_names(device_id)
+        if status and status.zones:
+            for zone in status.zones:
+                if zone.get("open", False):
+                    zone_index = zone["index"]
+                    open_zones.append(OpenZoneInfo(
+                        index=zone_index,
+                        name=f"Zona {zone_index + 1:02d}",
+                        friendly_name=friendly_names.get(zone_index)
+                    ))
+    except Exception as e:
+        logger.error(f"Error extracting open zones from status: {e}")
     return open_zones
 
 
@@ -536,6 +601,214 @@ async def arm_partition(
         raise HTTPException(status_code=503, detail=str(e.message))
     except Exception as e:
         logger.error(f"Unexpected error arming: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{device_id}/arm-multi", response_model=ArmMultiResponse)
+async def arm_partitions_atomic(
+    device_id: int,
+    request: ArmMultiRequest,
+    x_session_id: str = Header(..., alias="X-Session-ID")
+):
+    """
+    Atomically arm multiple partitions in a single ISECNet session (all-or-nothing).
+
+    WARNING: This will actually arm your alarm system!
+
+    Unlike the single-partition `/arm` endpoint (which the HA client loops over,
+    one call per partition), this endpoint performs a single open-zone pre-check
+    BEFORE arming ANY partition. If a relevant zone is open it returns 400 with
+    `OpenZonesError` and arms nothing. Otherwise it arms every requested partition
+    over the same connection and returns a consolidated result. This prevents the
+    "one partition fires the siren while the user is still deciding on bypass"
+    race that happens when arming partitions one HTTP call at a time.
+
+    LIMITATION (zone -> partition mapping): the ISECNet protocol status does NOT
+    expose which partition each zone belongs to (zones are a flat open/triggered
+    bitfield). The pre-check therefore considers ALL open zones. This is correct
+    for the "Ausente"/away mode that arms every partition. For a hypothetical
+    partial arm of a subset of partitions, an open zone belonging to a NON-targeted
+    partition would still block the operation (conservative / safe).
+
+    Args:
+        device_id: Alarm central ID
+        request: Multi-arm request with partitions (0-based indices), mode and password
+
+    Requires X-Session-ID header from login.
+    """
+    try:
+        # Get valid token to fetch device info
+        access_token = await auth_service.get_valid_token(x_session_id)
+
+        # Get password (from request or saved)
+        password = await _get_password(x_session_id, device_id, request.password, request.save_password)
+        if not password:
+            raise AlarmOperationError("Password required. Provide password or save one first.")
+
+        # Get device connection info from cloud API
+        conn_info = await _get_device_connection_info(access_token, device_id)
+        if not conn_info:
+            raise DeviceNotFoundError(f"Device {device_id} not found or connection info not available")
+
+        # Normalize / validate target partition indices (0-based, deduplicated, sorted)
+        target_partitions = sorted(set(request.partitions))
+        if any(p < 0 for p in target_partitions):
+            raise AlarmOperationError("Partition indices must be >= 0")
+
+        conn_type = "IP Receiver" if conn_info.use_ip_receiver else "Cloud"
+        cached_partitions_enabled = await state_manager.get_device_partitions_enabled(device_id)
+        logger.info(
+            f"Atomic arm device {device_id} (MAC: {conn_info.mac}) via {conn_type} "
+            f"partitions={target_partitions} mode={request.mode} partitions_enabled={cached_partitions_enabled}"
+        )
+
+        # --- PRE-CHECK: read status once, look for open zones (single session) ---
+        # NOTE: we deliberately do NOT disconnect after this read so the subsequent
+        # arm commands reuse the same authenticated ISECNet connection.
+        precheck_success, status, precheck_msg = await isecnet_client.get_status(
+            device_id=device_id,
+            mac=conn_info.mac,
+            password=password,
+            use_ip_receiver=conn_info.use_ip_receiver,
+            ip_receiver_addr=conn_info.ip_receiver_addr,
+            ip_receiver_port=conn_info.ip_receiver_port,
+            ip_receiver_account=conn_info.ip_receiver_account
+        )
+
+        if not precheck_success:
+            # Could not read status to validate -> treat as connection unavailable
+            await isecnet_client.disconnect(device_id)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "ConnectionUnavailable",
+                    "message": f"Conexao com a central indisponivel: {precheck_msg}. Verifique se o app AMT nao esta aberto.",
+                }
+            )
+
+        # Cache partitions_enabled (same as the status endpoints do) for the arm commands below
+        await state_manager.set_device_partitions_enabled(device_id, status.partitions_enabled)
+        effective_partitions_enabled = status.partitions_enabled
+
+        # If partitions are NOT enabled on the device, there is only one logical
+        # partition. Send a single arm command WITHOUT a partition byte (avoids 0xE3).
+        if not effective_partitions_enabled:
+            logger.info(
+                f"Device {device_id} has partitions disabled; arm-multi collapses to a single all-partitions arm"
+            )
+            target_partitions = [None]  # None -> protocol omits partition byte
+
+        # Open-zone pre-check (all-or-nothing). Reuse the status we already fetched.
+        open_zones = await _open_zones_from_status(device_id, status)
+        if open_zones:
+            logger.warning(
+                f"Atomic arm aborted for device {device_id}: {len(open_zones)} open zone(s), nothing armed"
+            )
+            # Leave connection open for the next operation (e.g. bypass then retry)
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "OpenZonesError",
+                    "message": "Não é possível armar: existem zonas abertas",
+                    "open_zones": [
+                        {
+                            "index": z.index,
+                            "name": z.name,
+                            "friendly_name": z.friendly_name
+                        }
+                        for z in open_zones
+                    ]
+                }
+            )
+
+        # --- ARM PHASE: zones are clear, arm every target partition over the same session ---
+        new_status = "armed_away" if request.mode == ArmMode.AWAY else "armed_stay"
+        results: List[PartitionArmResult] = []
+        any_connection_error = False
+        connection_error_msg = ""
+
+        for partition_index in target_partitions:
+            arm_success, arm_message = await isecnet_client.arm(
+                device_id=device_id,
+                mac=conn_info.mac,
+                password=password,
+                mode=request.mode.value,
+                partition_index=partition_index,
+                use_ip_receiver=conn_info.use_ip_receiver,
+                ip_receiver_addr=conn_info.ip_receiver_addr,
+                ip_receiver_port=conn_info.ip_receiver_port,
+                ip_receiver_account=conn_info.ip_receiver_account,
+                partitions_enabled=effective_partitions_enabled
+            )
+
+            # A V1 panel may not confirm (exit delay); "command sent" counts as accepted
+            # because the open-zone pre-check already passed in this same session.
+            accepted = arm_success
+            if not arm_success:
+                connection_errors = ["busy", "offline", "timeout", "connection", "not connected", "connect"]
+                if any(err in arm_message.lower() for err in connection_errors):
+                    any_connection_error = True
+                    connection_error_msg = arm_message
+
+            results.append(PartitionArmResult(
+                partition_index=(partition_index if partition_index is not None else -1),
+                success=accepted,
+                message=arm_message
+            ))
+
+        all_armed = all(r.success for r in results)
+
+        if not all_armed:
+            if any_connection_error:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "ConnectionUnavailable",
+                        "message": f"Conexao com a central indisponivel: {connection_error_msg}. Verifique se o app AMT nao esta aberto.",
+                    }
+                )
+            # Some partitions failed for a non-connection reason. Report it; note that
+            # because the pre-check passed, partial arming is unexpected here.
+            failed = [str(r.partition_index) for r in results if not r.success]
+            raise AlarmOperationError(
+                f"Failed to arm partition(s) {', '.join(failed)} atomically. "
+                "Some partitions may have been armed; verify status."
+            )
+
+        # Clear device cache to force refresh
+        await state_manager.delete_device_state(device_id)
+
+        # Broadcast a single SSE event for the whole atomic operation
+        await event_stream.broadcast_event({
+            "event_type": "state_changed",
+            "device_id": device_id,
+            "partition_id": None,
+            "new_status": new_status,
+            "source": "command",
+        }, event_type="alarm_event")
+
+        return ArmMultiResponse(
+            success=True,
+            device_id=device_id,
+            partitions=request.partitions,
+            new_status=new_status,
+            message=f"Armed {len(results)} partition(s) in {request.mode.value} mode",
+            results=results
+        )
+
+    except HTTPException:
+        # Re-raise HTTPExceptions (including OpenZonesError / ConnectionUnavailable) as-is
+        raise
+    except InvalidSessionError as e:
+        raise HTTPException(status_code=401, detail=str(e.message))
+    except AlarmOperationError as e:
+        raise HTTPException(status_code=400, detail=str(e.message))
+    except DeviceNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e.message))
+    except APIConnectionError as e:
+        raise HTTPException(status_code=503, detail=str(e.message))
+    except Exception as e:
+        logger.error(f"Unexpected error in atomic arm: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

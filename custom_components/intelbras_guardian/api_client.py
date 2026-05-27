@@ -247,6 +247,32 @@ class GuardianApiClient:
         )
         return result
 
+    async def arm_partitions_multi(
+        self,
+        device_id: int,
+        partition_indices: List[int],
+        mode: str = "away"
+    ) -> Dict[str, Any]:
+        """Atomically arm multiple partitions (all-or-nothing).
+
+        Uses the server-side /arm-multi endpoint, which pre-checks open zones
+        in a single ISECNet session and arms NOTHING if any zone is open
+        (returning open_zones), otherwise arms every target partition.
+
+        Args:
+            partition_indices: 0-based partition indices.
+            mode: "away" (total) or "home" (stay) — applied to all partitions.
+
+        Returns:
+            Dict with 'success' (bool); on failure 'error' (str) and
+            optionally 'open_zones' (list).
+        """
+        return await self._request_with_error(
+            "POST",
+            f"/api/v1/alarm/{device_id}/arm-multi",
+            {"partitions": partition_indices, "mode": mode}
+        )
+
     async def disarm_partition(
         self,
         device_id: int,
