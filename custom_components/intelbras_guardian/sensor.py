@@ -38,6 +38,13 @@ async def async_setup_entry(
                     device.get("mac", ""),
                 )
             )
+            entities.append(
+                GuardianLastTriggerSensor(
+                    coordinator,
+                    device_id,
+                    device.get("mac", ""),
+                )
+            )
 
         # Add wireless signal sensor for each wireless zone already known
         for zone in coordinator.data.get("zones", []):
@@ -168,6 +175,86 @@ class GuardianLastEventSensor(CoordinatorEntity, SensorEntity):
                     "device_id": last_event.get("device_id"),
                 }
         return {}
+
+
+class GuardianLastTriggerSensor(CoordinatorEntity, SensorEntity):
+    """Sensor showing the zone of the last real alarm trigger.
+
+    Unlike `GuardianLastEventSensor` (which reflects the last event of ANY
+    kind and is constantly overwritten by routine events such as the hourly
+    "Teste periódico"), this sensor only updates on a genuine trigger and is
+    populated synchronously with the panel's `triggered` state. Automations
+    that fire on `triggered` can read this to report the zone that actually
+    fired instead of the last unrelated event.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Último Disparo"
+    _attr_icon = "mdi:alarm-light"
+
+    def __init__(
+        self,
+        coordinator: GuardianCoordinator,
+        device_id: int,
+        device_mac: str,
+    ):
+        """Initialize the sensor."""
+        super().__init__(coordinator)
+        self._device_id = device_id
+        self._device_mac = device_mac
+        self._attr_unique_id = f"{device_mac}_last_trigger"
+
+    def _trigger(self) -> Optional[dict]:
+        """Return this device's last-trigger record from coordinator data."""
+        if self.coordinator.data:
+            return self.coordinator.data.get("_last_trigger", {}).get(self._device_id)
+        return None
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available (connection to panel is working)."""
+        if not self.coordinator.last_update_success:
+            return False
+        device = self.coordinator.get_device(self._device_id)
+        if device and device.get("connection_unavailable", False):
+            return False
+        return True
+
+    @property
+    def device_info(self):
+        """Return device info."""
+        device = self.coordinator.get_device(self._device_id)
+        if device:
+            return {
+                "identifiers": {(DOMAIN, self._device_mac)},
+                "name": device.get("description", f"Intelbras Alarm {self._device_id}"),
+                "manufacturer": "Intelbras",
+                "model": device.get("model", "Guardian Alarm"),
+            }
+        return None
+
+    @property
+    def native_value(self) -> Optional[str]:
+        """Return the friendly name of the zone that last triggered the alarm."""
+        trigger = self._trigger()
+        if trigger:
+            return trigger.get("zone_name") or "Disparo"
+        return "Sem disparos"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return extra state attributes."""
+        trigger = self._trigger()
+        if not trigger:
+            return {}
+        return {
+            "zone_index": trigger.get("zone_index"),
+            "zone_name": trigger.get("zone_name"),
+            "zones": trigger.get("zones"),
+            "event_type": trigger.get("event_type"),
+            "timestamp": trigger.get("timestamp"),
+            "device_id": trigger.get("device_id"),
+        }
 
 
 class GuardianWirelessSignalSensor(CoordinatorEntity, SensorEntity):

@@ -2,7 +2,7 @@
 import asyncio
 import logging
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from homeassistant.config_entries import ConfigEntry
@@ -37,6 +37,15 @@ class GuardianCoordinator(DataUpdateCoordinator):
         self.client = client
         self.entry = entry
         self._last_event_id: Optional[int] = None
+
+        # Last genuine alarm trigger per device, captured synchronously with
+        # the `is_triggered` flag from the zone(s) actually in alarm. Unlike
+        # `last_event` — which any routine event overwrites, including the
+        # hourly "Teste periódico" — this is updated ONLY by a real trigger,
+        # so automations reacting to the `triggered` state can read the zone
+        # that actually fired instead of the last unrelated event. Persists
+        # until the next trigger.
+        self._last_trigger: Dict[int, Dict[str, Any]] = {}
 
         # Triggered state safety timeout: only clears `is_triggered` when the API
         # has NOT confirmed it during the configured window — protects against
@@ -258,6 +267,23 @@ class GuardianCoordinator(DataUpdateCoordinator):
             "device_id": device_id,
         }
 
+        # Record the triggering zone (Bug: the disparo notification showed
+        # the last routine event — e.g. "Teste periódico" — because the
+        # generic last_event field is constantly overwritten). Only set when
+        # the SSE event carries zone info; otherwise the poll path fills it
+        # from the zone(s) reporting is_in_alarm.
+        if zone:
+            zone_name = zone.get("name") if isinstance(zone, dict) else str(zone)
+            self._last_trigger[device_id] = {
+                "zone_index": zone.get("index") if isinstance(zone, dict) else None,
+                "zone_name": zone_name,
+                "zones": [zone_name] if zone_name else [],
+                "event_type": event_data.get("event_name"),
+                "timestamp": event_data.get("timestamp") or datetime.now(timezone.utc).isoformat(),
+                "device_id": device_id,
+            }
+            self.data["_last_trigger"] = dict(self._last_trigger)
+
         # Notify HA that data changed — entities will see triggered state
         self.async_set_updated_data(self.data)
 
@@ -452,6 +478,30 @@ class GuardianCoordinator(DataUpdateCoordinator):
                                 status_zones = status.get("zones", [])
                     except Exception as e:
                         _LOGGER.debug(f"Could not get real-time status for device {device_id}: {e}")
+
+                # Capture the triggering zone SYNCHRONOUSLY with is_triggered,
+                # straight from the zone(s) the central reports as in-alarm.
+                # This closes the ~5s gap where the panel was already
+                # `triggered` but `last_event` still held the previous routine
+                # event ("Teste periódico"), so a `triggered`-fired automation
+                # reading the trigger zone now sees the zone that actually
+                # fired. Only updated while triggered AND a zone is
+                # identifiable — never overwritten by routine events.
+                if processed_devices[device_id].get("is_triggered") and status_zones:
+                    in_alarm = [z for z in status_zones if z.get("is_in_alarm")]
+                    candidates = in_alarm or [
+                        z for z in status_zones
+                        if z.get("is_open") and not z.get("is_bypassed")
+                    ]
+                    if candidates:
+                        self._last_trigger[device_id] = {
+                            "zone_index": candidates[0].get("index"),
+                            "zone_name": candidates[0].get("name"),
+                            "zones": [z.get("name") for z in candidates],
+                            "event_type": "Disparo de Setor",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "device_id": device_id,
+                        }
 
                 # Extract partitions (only for non-eletrificadores)
                 # Trust the partitions returned by the API, unless partitions_enabled is explicitly False
@@ -657,6 +707,7 @@ class GuardianCoordinator(DataUpdateCoordinator):
                 "_zone_index": zone_index,
                 "_partition_index": partition_index,
                 "_zone_triggered": zone_triggered,
+                "_last_trigger": dict(self._last_trigger),
             }
 
         except Exception as err:
