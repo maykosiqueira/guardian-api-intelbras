@@ -181,9 +181,10 @@ O protocolo usa:
 
 ### Painel de Controle de Alarme
 - Armar/desarmar partições individuais ou via alarme unificado
-- Modos de arme: Ausente (total) e Em Casa (stay/perímetro)
-- Alarme unificado com mapeamento configurável de partições por modo (Home/Away)
-- Detecção de estado disparado (com timeout automático de 10 min para estados stale)
+- Entidades de partição individual: expõem apenas Ausente (arm away) e Desarmar. Para os modos Em Casa/Ausente use a entidade de **alarme unificado**
+- Alarme unificado com mapeamento configurável de partições por modo (Home/Away) e modo de arme por partição (Total/Parcial)
+- Arme "Ausente" atômico: se houver zona aberta, **nenhuma** partição é armada (entidade permanece em "Armando") e uma notificação acionável "Ignorar Zonas e Armar" é enviada; só após a confirmação as zonas são anuladas e todas as partições armadas
+- Detecção de estado disparado
 - Status em tempo real via ISECNet (polling 1s)
 - Estado otimista para feedback imediato na UI
 - Detecção de indisponibilidade: entidades ficam "Unavailable" quando a conexão com a central cai
@@ -213,12 +214,16 @@ O protocolo usa:
 - Notificação dismissada automaticamente após arme bem-sucedido
 - `persistent_notification` como fallback quando não há mobile_app
 
-### Botão Desligar Sirene
-- Desliga a sirene da central sem alterar o estado de arme
+### Botões (Pânico e Sirene)
+- **Desligar Sirene**: silencia a sirene da central; quando a central está disparada, envia `DEACTIVATE_CENTRAL` para também encerrar um pânico (apenas centrais de alarme, não eletrificadores)
+- **Pânico Audível** e **Pânico Silencioso**: disponíveis em todas as centrais com senha salva
+- **Pânico Incêndio** e **Emergência Médica**: apenas na família AMT 8000
+- Os botões de pânico só são criados para dispositivos com senha salva
 
-### Sensor de Evento
-- Informação do último evento
-- Atributos do histórico de eventos
+### Sensores de Evento
+- **Last Event**: título/atributos do último evento de qualquer tipo (pode ser sobrescrito por eventos rotineiros, como o "Teste periódico" horário)
+- **Último Disparo**: zona do último disparo real do alarme, sincronizado com o estado `triggered` (não é poluído por eventos rotineiros)
+- **Evento de zona** (plataforma `event`): uma entidade por zona que dispara o evento `triggered` quando a zona é acionada
 - Eventos em tempo real via SSE (Server-Sent Events)
 
 ## Início Rápido
@@ -226,7 +231,7 @@ O protocolo usa:
 ### Pré-requisitos
 
 - Docker e Docker Compose
-- Home Assistant 2023.x ou posterior
+- Home Assistant 2024.1.0 ou posterior (conforme `hacs.json`)
 - Sistema de alarme Intelbras Guardian com acesso à nuvem
 - Conta Intelbras (email + senha)
 - Senha do dispositivo (programada na central de alarme)
@@ -298,11 +303,12 @@ Use o Add-on (Opção 1) que já inclui a API integrada.
 
 1. Vá em **Configurações** → **Dispositivos e Serviços** → **Adicionar Integração**
 2. Procure por "**Intelbras Guardian**"
-3. Preencha:
-   - **Email**: Email da sua conta Intelbras
-   - **Senha**: Senha da sua conta Intelbras
+3. Preencha os dados da conexão com o middleware:
    - **Host FastAPI**: IP do container FastAPI (ex: 192.168.1.100)
    - **Porta FastAPI**: 8000 (padrão)
+4. A integração inicia o fluxo OAuth: abra o link exibido no navegador, faça login na sua conta Intelbras e cole de volta a **URL de callback completa** (a integração não pede email/senha diretamente)
+
+> Se a sessão expirar mais tarde, use **Configurar → Re-autenticar** para refazer o OAuth sem remover a integração.
 
 ### 5. Salvar Senha do Dispositivo
 
@@ -383,20 +389,22 @@ guardian-api-intelbras/
 ├── docker/                           # Docker Compose Standalone
 │   ├── Dockerfile                    # Build da imagem (standalone)
 │   └── docker-compose.yml
-├── home_assistant/                   # Integração Home Assistant
-│   └── custom_components/
-│       └── intelbras_guardian/
-│           ├── __init__.py
-│           ├── manifest.json
-│           ├── config_flow.py
-│           ├── coordinator.py
-│           ├── api_client.py
-│           ├── alarm_control_panel.py  # Partições + alarme unificado
-│           ├── binary_sensor.py       # Zonas + bateria wireless
-│           ├── sensor.py              # Último evento + sinal wireless
-│           ├── switch.py              # Choque/alarme eletrificador
-│           ├── button.py              # Desligar sirene
-│           └── const.py
+├── custom_components/                 # Integração Home Assistant (raiz, para HACS)
+│   └── intelbras_guardian/
+│       ├── __init__.py
+│       ├── manifest.json
+│       ├── config_flow.py
+│       ├── coordinator.py
+│       ├── api_client.py
+│       ├── alarm_control_panel.py    # Partições + alarme unificado
+│       ├── binary_sensor.py          # Zonas + bateria wireless
+│       ├── sensor.py                 # Last Event + Último Disparo + sinal wireless
+│       ├── switch.py                 # Choque/alarme eletrificador
+│       ├── button.py                 # Desligar sirene + pânicos
+│       ├── event.py                  # Eventos de disparo de zona
+│       ├── const.py
+│       ├── strings.json
+│       └── translations/             # en.json, pt-BR.json
 └── docs/                             # Documentação
 ```
 

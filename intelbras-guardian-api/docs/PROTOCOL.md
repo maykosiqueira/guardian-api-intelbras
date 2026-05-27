@@ -169,7 +169,7 @@ Payload: `[partition_index][operation]`
 | GET_COMPLETE_INFO | 0x49 | 73 | 'I' | Informações completas |
 | ACTIVATE_CENTRAL | 0x41 | 65 | 'A' | Armar |
 | DEACTIVATE_CENTRAL | 0x44 | 68 | 'D' | Desarmar |
-| PANIC | 0x50 | 80 | 'P' | Pânico |
+| PANIC | 0x45 | 69 | 'E' | Pânico (payload `[69, tipo]` em centrais não-AMT8000) |
 | SIREN_OFF | 0x4F | 79 | 'O' | Desligar sirene |
 | PGM | 0x47 | 71 | 'G' | Controle PGM |
 | BYPASS | 0x42 | 66 | 'B' | Bypass de zonas (bitmask) |
