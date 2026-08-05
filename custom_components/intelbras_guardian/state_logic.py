@@ -157,3 +157,48 @@ def classify_arm_mode(
         return "home"
     # Mixed: any partition exclusive to the away set tips it to away.
     return "away" if any(i in away_set and i not in home_set for i in armed) else "home"
+
+
+def build_last_trigger_attrs(
+    trigger: Optional[Mapping[str, object]],
+    *,
+    is_triggered: bool,
+    started_at: Optional[float],
+) -> dict:
+    """Describe the last alarm trigger for the panel's state attributes.
+
+    The panel carries the triggering zone in its OWN attributes so it changes
+    atomically with the `triggered` state. Automations firing on `triggered`
+    used to read `sensor.*_ultimo_disparo`, which is written by a different
+    platform ~24ms later — long enough for the alert to go out naming the
+    previous trigger (2026-07-29 13:37: "Ultimo evento: Sem disparos").
+
+    ``last_trigger_is_current`` distinguishes the trigger in progress from a
+    leftover record of an earlier alarm, so templates can fall back instead
+    of naming a zone that has nothing to do with the current alarm.
+    """
+    if not trigger:
+        return {
+            "last_trigger_zone": None,
+            "last_trigger_zones": [],
+            "last_trigger_time": None,
+            "last_trigger_is_current": False,
+        }
+
+    # Both writers stamp `captured_at` after `started_at` within the same
+    # transition, so a record captured before the current trigger began
+    # necessarily belongs to an earlier alarm.
+    captured_at = trigger.get("captured_at")
+    is_current = bool(
+        is_triggered
+        and started_at is not None
+        and isinstance(captured_at, (int, float))
+        and captured_at >= started_at
+    )
+
+    return {
+        "last_trigger_zone": trigger.get("zone_name"),
+        "last_trigger_zones": trigger.get("zones") or [],
+        "last_trigger_time": trigger.get("timestamp"),
+        "last_trigger_is_current": is_current,
+    }

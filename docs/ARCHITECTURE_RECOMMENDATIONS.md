@@ -106,6 +106,17 @@ Em vez de mapear estados do painel → estados HA por uma tabela única, o códi
   `is_in_alarm` (`coordinator.py:482-504`) e expondo `GuardianLastTriggerSensor` (`sensor.py`,
   novo). Mas o problema de fundo — automações lendo um campo "último de qualquer coisa" no
   instante de uma transição — continua latente para qualquer outro consumidor de `last_event`.
+- **Corrida entre ENTIDADES do mesmo update** (incidente 2026-07-29 13:37, zona 43 / CAM 4
+  PISCINA): `sensor.*_ultimo_disparo` já tinha a zona certa no dicionário do coordinator, mas
+  a plataforma `alarm_control_panel` é configurada primeiro (`const.PLATFORMS`) e escreve o
+  estado `triggered` **~24 ms antes** de o sensor escrever o dele. A automação disparada por
+  `to: triggered` leu o sensor ainda com o valor anterior e alertou
+  `"ALARME DISPAROU! Ultimo evento: Sem disparos"` (comprovado no trace da automação).
+  Corrigido levando a zona nos atributos do PRÓPRIO painel — `last_trigger_zone`,
+  `last_trigger_zones`, `last_trigger_time`, `last_trigger_is_current` (`state_logic.
+  build_last_trigger_attrs`, exposto pelas duas classes de painel) — que mudam atomicamente
+  com o estado. **Regra geral: o que a automação precisa ler no instante da transição tem de
+  viajar como atributo da entidade que dispara a transição, nunca em outra entidade.**
 - **Timezones**: o coordinator emite UTC (`datetime.now(timezone.utc).isoformat()`,
   `coordinator.py:282` e `:502`); `sensor.py:160-162` faz `fromisoformat(ts.replace("Z","+00:00"))`;
   a API REST do HA retorna timestamps em **UTC** mas interpreta parâmetros sem tz como **hora

@@ -25,7 +25,11 @@ from .const import (
     STATE_MAPPING,
 )
 from .coordinator import GuardianCoordinator
-from .state_logic import classify_arm_mode, compute_unified_state
+from .state_logic import (
+    build_last_trigger_attrs,
+    classify_arm_mode,
+    compute_unified_state,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -69,6 +73,35 @@ def _pre_trigger_arm_mode_attr(coordinator: GuardianCoordinator, device_id: int)
     if pre_mode in ("armed_stay", "armed_home"):
         return "home"
     return None
+
+
+def _last_trigger_attrs(
+    coordinator: GuardianCoordinator, device_id: int
+) -> Dict[str, Any]:
+    """Expose the triggering zone as attributes of the panel itself.
+
+    Automations fire on the panel's `triggered` state and used to read
+    `sensor.<device>_ultimo_disparo` to name the zone. Both entities are fed
+    by the SAME coordinator update, but the alarm_control_panel platform is
+    set up first, so its listener writes the new state (and runs the
+    automation) ~24ms BEFORE the sensor writes the zone — the automation read
+    the *previous* value ("Sem disparos" right after a restart). Carrying the
+    zone in the panel's own attributes makes it atomic with the state change:
+    `trigger.to_state.attributes.last_trigger_zone` is always the zone of the
+    trigger that just fired.
+
+    `last_trigger_is_current` tells whether the record belongs to the trigger
+    in progress (vs. a leftover from a previous alarm), so templates can fall
+    back gracefully when the central reports a trigger without an
+    identifiable zone.
+    """
+    data = coordinator.data or {}
+    device = (data.get("devices") or {}).get(device_id) or {}
+    return build_last_trigger_attrs(
+        (data.get("_last_trigger") or {}).get(device_id),
+        is_triggered=bool(device.get("is_triggered")),
+        started_at=coordinator.trigger_started_at(device_id),
+    )
 
 
 async def async_setup_entry(
@@ -364,6 +397,7 @@ class GuardianAlarmControlPanel(CoordinatorEntity, AlarmControlPanelEntity):
             attrs["last_updated"] = device.get("last_updated")
 
         attrs["pre_trigger_arm_mode"] = _pre_trigger_arm_mode_attr(self.coordinator, self._device_id)
+        attrs.update(_last_trigger_attrs(self.coordinator, self._device_id))
         return attrs
 
     def _get_current_partition_state(self) -> Optional[str]:
@@ -913,6 +947,7 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
             attrs["connection_unavailable_raw"] = device.get("connection_unavailable_raw", False)
             attrs["last_updated"] = device.get("last_updated")
 
+        attrs.update(_last_trigger_attrs(self.coordinator, self._device_id))
         return attrs
 
     def _schedule_optimistic_clear(self, expected_state, timeout=15):
