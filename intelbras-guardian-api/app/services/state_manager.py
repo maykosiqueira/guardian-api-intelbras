@@ -31,7 +31,7 @@ class InMemoryStateManager:
         """Initialize the state manager."""
         self._tokens: Dict[str, Dict[str, Any]] = {}
         self._device_state: Dict[str, Dict[str, Any]] = {}
-        self._device_passwords: Dict[str, Dict[str, str]] = {}  # session_id -> {device_id: password}
+        self._device_passwords: Dict[str, str] = {}  # device_id -> ISECNet password
         self._device_conn_info: Dict[str, Dict[str, Any]] = {}  # device_id -> connection info cache
         self._device_partitions_enabled: Dict[str, bool] = {}  # device_id -> partitions_enabled (from status)
         self._zone_friendly_names: Dict[str, Dict[int, str]] = {}  # device_id -> {zone_index: friendly_name}
@@ -50,7 +50,9 @@ class InMemoryStateManager:
                 with open(SESSIONS_FILE, "r") as f:
                     data = json.load(f)
                     self._tokens = data.get("tokens", {})
-                    self._device_passwords = data.get("device_passwords", {})
+                    self._device_passwords = self._migrate_device_passwords(
+                        data.get("device_passwords", {})
+                    )
                     # Load zone friendly names (convert string keys back to int)
                     raw_zone_names = data.get("zone_friendly_names", {})
                     self._zone_friendly_names = {}
@@ -58,7 +60,7 @@ class InMemoryStateManager:
                         self._zone_friendly_names[device_id] = {int(k): v for k, v in zones.items()}
                     # Load last known status (persistent cache for connection failures)
                     self._last_known_status = data.get("last_known_status", {})
-                    logger.info(f"Loaded {len(self._tokens)} sessions, {len(self._device_passwords)} password sets, {len(self._zone_friendly_names)} zone configs, {len(self._last_known_status)} last known statuses from file")
+                    logger.info(f"Loaded {len(self._tokens)} sessions, {len(self._device_passwords)} device passwords, {len(self._zone_friendly_names)} zone configs, {len(self._last_known_status)} last known statuses from file")
         except Exception as e:
             logger.warning(f"Could not load sessions from file: {e}")
             self._tokens = {}
@@ -317,83 +319,104 @@ class InMemoryStateManager:
             return {
                 "active_sessions": len(self._tokens),
                 "cached_devices": len(self._device_state),
-                "saved_passwords": sum(len(p) for p in self._device_passwords.values()),
+                "saved_passwords": len(self._device_passwords),
                 "backend": "memory"
             }
 
     # Device password management
+    #
+    # The ISECNet password belongs to the PANEL, not to whoever is logged in,
+    # so it is stored per device_id. It used to be keyed by session_id, which
+    # meant every re-authentication produced a session with no passwords:
+    # `has_saved_password` went false, the middleware stopped polling the panel
+    # over ISECNet, and HA silently lost zone open/closed, battery, signal and
+    # the panic buttons until someone typed the password in again. The
+    # session_id parameters are kept so callers do not change, and the old
+    # nested {session: {device: password}} files are migrated on load.
+
+    def _migrate_device_passwords(self, stored: Dict[str, Any]) -> Dict[str, str]:
+        """Flatten a legacy {session_id: {device_id: password}} mapping."""
+        if not stored:
+            return {}
+        if all(isinstance(v, str) for v in stored.values()):
+            return dict(stored)  # already device-keyed
+
+        flat: Dict[str, str] = {}
+        for value in stored.values():
+            if isinstance(value, dict):
+                flat.update({str(k): v for k, v in value.items()})
+            elif isinstance(value, str):
+                flat[str(value)] = value
+        if flat:
+            logger.info(
+                f"Migrated {len(flat)} device password(s) from per-session to "
+                "per-device storage"
+            )
+        return flat
 
     async def set_device_password(self, session_id: str, device_id: str, password: str) -> None:
         """
-        Store device password for a session.
+        Store the ISECNet password of a device.
 
         Args:
-            session_id: Session identifier
+            session_id: Session identifier (unused; kept for call compatibility)
             device_id: Device identifier
-            password: Device password (6 digits)
+            password: Device password (4-6 digits)
         """
         async with self._lock:
-            if session_id not in self._device_passwords:
-                self._device_passwords[session_id] = {}
-            self._device_passwords[session_id][str(device_id)] = password
+            self._device_passwords[str(device_id)] = password
             self._save_sessions()
-            logger.debug(f"Stored password for device {device_id} in session {session_id[:8]}...")
+            logger.debug(f"Stored password for device {device_id}")
 
     async def get_device_password(self, session_id: str, device_id: str) -> Optional[str]:
         """
-        Get stored device password for a session.
+        Get the stored ISECNet password of a device.
 
         Args:
-            session_id: Session identifier
+            session_id: Session identifier (unused; kept for call compatibility)
             device_id: Device identifier
 
         Returns:
             Password string or None if not found
         """
         async with self._lock:
-            session_passwords = self._device_passwords.get(session_id, {})
-            return session_passwords.get(str(device_id))
+            return self._device_passwords.get(str(device_id))
 
     async def delete_device_password(self, session_id: str, device_id: str) -> None:
         """
-        Delete stored device password.
+        Delete a stored device password.
 
         Args:
-            session_id: Session identifier
+            session_id: Session identifier (unused; kept for call compatibility)
             device_id: Device identifier
         """
         async with self._lock:
-            if session_id in self._device_passwords:
-                if str(device_id) in self._device_passwords[session_id]:
-                    del self._device_passwords[session_id][str(device_id)]
-                    self._save_sessions()
-                    logger.debug(f"Deleted password for device {device_id} in session {session_id[:8]}...")
+            if str(device_id) in self._device_passwords:
+                del self._device_passwords[str(device_id)]
+                self._save_sessions()
+                logger.debug(f"Deleted password for device {device_id}")
 
     async def get_all_device_passwords(self, session_id: str) -> Dict[str, str]:
         """
-        Get all stored device passwords for a session.
+        Get every stored device password.
 
         Args:
-            session_id: Session identifier
+            session_id: Session identifier (unused; kept for call compatibility)
 
         Returns:
             Dict mapping device_id to password
         """
         async with self._lock:
-            return self._device_passwords.get(session_id, {}).copy()
+            return self._device_passwords.copy()
 
     async def cleanup_session_passwords(self, session_id: str) -> None:
         """
-        Remove all passwords for a session (called on logout).
+        No-op kept for call compatibility.
 
-        Args:
-            session_id: Session identifier
+        Passwords are per device now, so logging out of one session must not
+        erase the panel password the next session will need.
         """
-        async with self._lock:
-            if session_id in self._device_passwords:
-                del self._device_passwords[session_id]
-                self._save_sessions()
-                logger.debug(f"Cleaned up passwords for session {session_id[:8]}...")
+        return None
 
     # Device connection info caching (for performance)
 
