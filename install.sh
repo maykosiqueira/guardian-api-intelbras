@@ -1005,9 +1005,15 @@ update() {
             print_success "Código atualizado"
         fi
 
-        # Re-exec the updated script so new code paths take effect
+        # Re-exec the updated script so new code paths take effect.
+        # -y has to be carried over: without it the second run goes back to
+        # interactive mode and blocks on a prompt when there is no terminal
+        # (e.g. `ssh pi install.sh -y --update`).
         export _GUARDIAN_REEXEC=1
         chmod +x "$INSTALL_DIR/install.sh"
+        if [ "$NON_INTERACTIVE" = true ]; then
+            exec bash "$INSTALL_DIR/install.sh" -y --update
+        fi
         exec bash "$INSTALL_DIR/install.sh" --update
     fi
     unset _GUARDIAN_REEXEC
