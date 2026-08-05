@@ -33,6 +33,9 @@ def _panel():
     coordinator.data = {"devices": {DEVICE_ID: {}}}
 
     panel = GuardianUnifiedAlarmControlPanel.__new__(GuardianUnifiedAlarmControlPanel)
+    # async_alarm_arm_* only schedules the real work via
+    # hass.async_create_task; collect the coroutines so the test can run them.
+    panel_tasks: list = []
     panel.coordinator = coordinator
     panel._device_id = DEVICE_ID
     panel._partitions = [{"id": 1775173}, {"id": 1775174}]
@@ -43,14 +46,26 @@ def _panel():
     panel._optimistic_state = None
     panel._last_arm_intent = None
     panel.hass = MagicMock()
+    panel.hass.async_create_task = panel_tasks.append
     panel.async_write_ha_state = MagicMock()
     panel._schedule_optimistic_clear = MagicMock()
     panel._store_bypass_and_notify = MagicMock()
+    panel._pending_tasks = panel_tasks
     return panel
 
 
+def _run(panel, coro):
+    """Call an arm method and actually execute the task it schedules."""
+    async def _drive():
+        await coro
+        while panel._pending_tasks:
+            await panel._pending_tasks.pop(0)
+
+    asyncio.run(_drive())
+
+
 def _arm_away(panel):
-    asyncio.run(panel.async_alarm_arm_away())
+    _run(panel, panel.async_alarm_arm_away())
 
 
 def test_normal_arm_keeps_the_server_precheck():
@@ -93,6 +108,6 @@ def test_arm_home_also_consumes_the_skip_flag():
     panel.coordinator.client.disarm_partition = AsyncMock(return_value={"success": True})
     panel.coordinator.async_request_refresh = AsyncMock()
 
-    asyncio.run(panel.async_alarm_arm_home())
+    _run(panel, panel.async_alarm_arm_home())
 
     assert panel._skip_open_zone_check is False
