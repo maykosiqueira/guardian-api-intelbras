@@ -53,6 +53,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._port: Optional[int] = None
         self._auth_url: Optional[str] = None
         self._client: Optional[GuardianApiClient] = None
+        self._reauth_entry: Optional[config_entries.ConfigEntry] = None
 
     @staticmethod
     @callback
@@ -137,6 +138,78 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="oauth",
+            data_schema=STEP_OAUTH_SCHEMA,
+            errors=errors,
+            description_placeholders={
+                "auth_url": self._auth_url or "",
+                "api_url": f"http://{self._host}:{self._port}",
+            },
+        )
+
+    async def async_step_reauth(
+        self,
+        entry_data: Dict[str, Any]
+    ) -> FlowResult:
+        """
+        Handle re-authentication requested by Home Assistant itself.
+
+        The coordinator raises ConfigEntryAuthFailed when the middleware
+        session dies, which makes HA start this flow: the integration shows
+        the standard "reconfigure" card plus a notification, instead of the
+        user having to notice that the alarm silently stopped updating.
+        """
+        self._reauth_entry = self.hass.config_entries.async_get_entry(
+            self.context["entry_id"]
+        )
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self,
+        user_input: Optional[Dict[str, Any]] = None
+    ) -> FlowResult:
+        """Show the OAuth URL and take the callback URL back."""
+        errors: Dict[str, str] = {}
+        entry = self._reauth_entry
+
+        if entry is None:
+            return self.async_abort(reason="reauth_failed")
+
+        self._host = entry.data.get(CONF_FASTAPI_HOST)
+        self._port = entry.data.get(CONF_FASTAPI_PORT, DEFAULT_FASTAPI_PORT)
+
+        # Reuse the running coordinator's client so the session it obtains is
+        # the same object the entities already talk through.
+        coordinator = self.hass.data.get(DOMAIN, {}).get(entry.entry_id)
+        client = coordinator.client if coordinator else GuardianApiClient(
+            host=self._host,
+            port=self._port,
+            session=async_get_clientsession(self.hass),
+        )
+
+        if user_input is not None:
+            callback_url = user_input.get("callback_url", "").strip()
+
+            if not callback_url:
+                errors["base"] = "callback_url_required"
+            elif await client.complete_oauth(callback_url):
+                self.hass.config_entries.async_update_entry(
+                    entry,
+                    data={**entry.data, CONF_SESSION_ID: client.session_id},
+                )
+                await self.hass.config_entries.async_reload(entry.entry_id)
+                return self.async_abort(reason="reauth_successful")
+            else:
+                errors["base"] = "oauth_callback_failed"
+
+        # A fresh OAuth state per form render (the middleware keeps the PKCE
+        # verifier in memory keyed by state).
+        oauth_data = await client.start_oauth()
+        if not oauth_data:
+            errors["base"] = "oauth_start_failed"
+        self._auth_url = (oauth_data or {}).get("auth_url", "")
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
             data_schema=STEP_OAUTH_SCHEMA,
             errors=errors,
             description_placeholders={

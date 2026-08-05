@@ -18,6 +18,7 @@ Authentication Flow:
 2. User opens URL, logs in, gets redirected with ?code=xxx
 3. POST /api/v1/auth/callback with code -> Returns session_id
 """
+import asyncio
 import logging
 import secrets
 import uuid
@@ -72,6 +73,7 @@ class AuthService:
         self.client_id = settings.INTELBRAS_CLIENT_ID
         self.refresh_buffer = settings.TOKEN_REFRESH_BUFFER
         self._session: Optional[aiohttp.ClientSession] = None
+        self._refresh_task: Optional[asyncio.Task] = None
         # Generate a persistent device ID for this middleware instance
         self._device_id = str(uuid.uuid4())
 
@@ -604,8 +606,14 @@ class AuthService:
                 logger.info(f"Token expiring soon, attempting refresh for session {session_id[:8]}...")
                 try:
                     token_data = await self._refresh_token(session_id, token_data)
-                except TokenRefreshError:
-                    # If refresh fails, token may still be valid
+                except TokenRefreshError as e:
+                    # If refresh fails, token may still be valid. This used to be
+                    # swallowed silently, which hid the fact that the refresh had
+                    # been broken all along until the access token finally died.
+                    logger.warning(
+                        f"Token refresh failed for session {session_id[:8]}... "
+                        f"({e}). Access token still valid until {expires_at.isoformat()}Z."
+                    )
                     if expires_at <= datetime.utcnow():
                         raise TokenExpiredError("Token expired and refresh failed")
 
@@ -634,13 +642,15 @@ class AuthService:
             raise TokenRefreshError("No refresh token available")
 
         session = await self._get_session()
+        last_error = "no endpoint attempted"
 
         # OAuth token refresh endpoints (from APK AuthServiceClient)
-        refresh_endpoints = [
+        # Canonical endpoint first; the /oauth2/token variant answers 404 and the
+        # third entry used to be an exact duplicate of the first.
+        refresh_endpoints = list(dict.fromkeys([
             f"{self.oauth_url}/token",
-            "https://api.conta.intelbras.com/auth/token",
-            f"{self.oauth_url}/oauth2/token",
-        ]
+            self.OAUTH_TOKEN_URL,
+        ]))
 
         for endpoint in refresh_endpoints:
             try:
@@ -658,19 +668,25 @@ class AuthService:
 
                 async with session.post(endpoint, data=data, headers=headers) as response:
                     response_text = await response.text()
-                    logger.debug(f"Refresh response {response.status}: {response_text[:200]}")
 
                     if response.status == 200:
                         new_token_data = await response.json()
                         if new_token_data.get("access_token"):
                             logger.info("Token refresh successful")
                             return await self._update_token(session_id, token_data, new_token_data)
+                        last_error = f"{endpoint}: 200 without access_token"
+                    else:
+                        last_error = f"{endpoint}: HTTP {response.status} {response_text[:160]}"
+                    # WARNING, not debug: with LOG_LEVEL=INFO the real reason for
+                    # a failing refresh was invisible.
+                    logger.warning(f"Token refresh rejected — {last_error}")
 
             except Exception as e:
-                logger.debug(f"Refresh failed for {endpoint}: {e}")
+                last_error = f"{endpoint}: {e}"
+                logger.warning(f"Token refresh error — {last_error}")
                 continue
 
-        raise TokenRefreshError("All refresh endpoints failed")
+        raise TokenRefreshError(f"All refresh endpoints failed (last: {last_error})")
 
     async def _update_token(
         self,
@@ -696,6 +712,66 @@ class AuthService:
         logger.info(f"Token refreshed for session {session_id[:8]}...")
 
         return updated_data
+
+    async def start_proactive_refresh_task(self) -> None:
+        """
+        Refresh every stored session on a fixed cadence.
+
+        Waiting for TOKEN_REFRESH_BUFFER (5 min before expiry) is not enough:
+        the Intelbras access token lives far longer than the refresh token that
+        is supposed to renew it, so by the time the buffer kicked in the refresh
+        token was already dead ("invalid_grant: Persisted access token data not
+        found") and the session was lost until an interactive OAuth login.
+        Refreshing hourly keeps the rotating refresh token young.
+        """
+        if settings.TOKEN_PROACTIVE_REFRESH_INTERVAL <= 0:
+            logger.info("Proactive token refresh disabled")
+            return
+        if self._refresh_task is None or self._refresh_task.done():
+            self._refresh_task = asyncio.create_task(self._proactive_refresh_loop())
+            logger.info(
+                "Proactive token refresh started "
+                f"(every {settings.TOKEN_PROACTIVE_REFRESH_INTERVAL}s)"
+            )
+
+    async def stop_proactive_refresh_task(self) -> None:
+        """Stop the proactive refresh loop."""
+        if self._refresh_task:
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
+            self._refresh_task = None
+            logger.info("Proactive token refresh stopped")
+
+    async def _proactive_refresh_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(settings.TOKEN_PROACTIVE_REFRESH_INTERVAL)
+                await self.refresh_all_sessions()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in proactive refresh loop: {e}")
+
+    async def refresh_all_sessions(self) -> Dict[str, bool]:
+        """Refresh every stored session. Returns {session_id: succeeded}."""
+        results: Dict[str, bool] = {}
+        for session_id in await state_manager.get_all_session_ids():
+            token_data = await state_manager.get_token(session_id)
+            if not token_data:
+                continue
+            try:
+                await self._refresh_token(session_id, token_data)
+                results[session_id] = True
+            except TokenRefreshError as e:
+                results[session_id] = False
+                logger.error(
+                    f"Proactive refresh failed for session {session_id[:8]}...: {e}. "
+                    "Session will die when the current access token expires."
+                )
+        return results
 
     async def logout(self, session_id: str) -> bool:
         """

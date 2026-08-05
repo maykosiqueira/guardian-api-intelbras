@@ -15,6 +15,13 @@
         "data": {
           "callback_url": "URL de Callback (cole a URL completa após o login)"
         }
+      },
+      "reauth_confirm": {
+        "title": "Intelbras Guardian - Reautenticar",
+        "description": "A sessão com a central expirou e o alarme parou de ser lido. Para restabelecer:\n\n1. Abra o link abaixo no seu navegador:\n\n**{auth_url}**\n\n2. Faça login com sua conta Intelbras\n\n3. O navegador vai tentar abrir `localhost:8000` e falhar — isso é esperado\n\n4. Copie a **URL completa** da barra de endereço (a que contém `code=` e `state=`) e cole abaixo\n\nAPI: {api_url}",
+        "data": {
+          "callback_url": "URL de Callback (cole a URL completa após o login)"
+        }
       }
     },
     "error": {
@@ -25,7 +32,9 @@
       "unknown": "Ocorreu um erro inesperado."
     },
     "abort": {
-      "already_configured": "Esta instância da API já está configurada."
+      "already_configured": "Esta instância da API já está configurada.",
+      "reauth_successful": "Reautenticação concluída. A comunicação com o alarme foi restabelecida.",
+      "reauth_failed": "Não foi possível reautenticar: a integração não foi encontrada."
     }
   },
   "options": {

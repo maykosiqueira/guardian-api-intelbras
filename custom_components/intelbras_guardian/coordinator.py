@@ -1,5 +1,6 @@
 """Data update coordinator for Intelbras Guardian."""
 import asyncio
+import inspect
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -7,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
@@ -16,6 +18,10 @@ from .api_client import GuardianApiClient
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, EVENT_ALARM
 
 _LOGGER = logging.getLogger(__name__)
+
+_COORDINATOR_TAKES_CONFIG_ENTRY = "config_entry" in inspect.signature(
+    DataUpdateCoordinator.__init__
+).parameters
 
 
 class GuardianCoordinator(DataUpdateCoordinator):
@@ -28,11 +34,20 @@ class GuardianCoordinator(DataUpdateCoordinator):
         entry: ConfigEntry,
     ):
         """Initialize the coordinator."""
+        # Binding the config entry is what lets DataUpdateCoordinator start the
+        # reauth flow by itself when _async_update_data raises
+        # ConfigEntryAuthFailed. HA >= 2024.10 takes it as a keyword argument;
+        # older versions pick it up from the config_entries.current_entry
+        # contextvar, which is set while async_setup_entry runs.
+        extra: Dict[str, Any] = (
+            {"config_entry": entry} if _COORDINATOR_TAKES_CONFIG_ENTRY else {}
+        )
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
             update_interval=timedelta(seconds=DEFAULT_SCAN_INTERVAL),
+            **extra,
         )
         self.client = client
         self.entry = entry
@@ -46,6 +61,17 @@ class GuardianCoordinator(DataUpdateCoordinator):
         # that actually fired instead of the last unrelated event. Persists
         # until the next trigger.
         self._last_trigger: Dict[int, Dict[str, Any]] = {}
+
+        # time.perf_counter() stamp of the False->True transition of each
+        # device's triggered state. Lets consumers tell whether the record in
+        # `_last_trigger` belongs to the alarm currently ringing or is a
+        # leftover from a previous one (see `_last_trigger_attrs` in
+        # alarm_control_panel.py). Cleared when the device leaves triggered.
+        # perf_counter, not wall-clock: it is only ever compared against
+        # `captured_at`, and both time.time() and time.monotonic() on
+        # Windows tick every ~15.6ms — coarse enough for two consecutive
+        # events to tie and for a stale record to pass as current.
+        self._trigger_started_at: Dict[int, float] = {}
 
         # Triggered state safety timeout: only clears `is_triggered` when the API
         # has NOT confirmed it during the configured window — protects against
@@ -98,6 +124,15 @@ class GuardianCoordinator(DataUpdateCoordinator):
         # SSE listener
         self._sse_task: Optional[asyncio.Task] = None
         self._sse_stop_event: Optional[asyncio.Event] = None
+
+        # Lost-session handling. The middleware session dies when its OAuth
+        # token can no longer be refreshed, and only an interactive re-auth
+        # brings it back. Without this the coordinator kept polling once a
+        # second and logging one warning per second (~86k lines/day) while
+        # nothing told the user the alarm had gone silent.
+        self._unauth_notified = False
+        self._normal_update_interval = timedelta(seconds=DEFAULT_SCAN_INTERVAL)
+        self._unauth_update_interval = timedelta(seconds=60)
 
     async def start_sse_listener(self) -> None:
         """Start SSE listener for real-time events."""
@@ -231,6 +266,7 @@ class GuardianCoordinator(DataUpdateCoordinator):
         # before the alarm fired (the AMT_2018_E_SMART zeroes the partition
         # byte during an active alarm, which would otherwise be lost).
         if not device.get("is_triggered"):
+            self._trigger_started_at[device_id] = time.perf_counter()
             prev_arm_mode = device.get("arm_mode")
             if isinstance(prev_arm_mode, str) and prev_arm_mode.startswith("armed"):
                 self._pre_trigger_arm_mode[device_id] = prev_arm_mode
@@ -280,6 +316,7 @@ class GuardianCoordinator(DataUpdateCoordinator):
                 "zones": [zone_name] if zone_name else [],
                 "event_type": event_data.get("event_name"),
                 "timestamp": event_data.get("timestamp") or datetime.now(timezone.utc).isoformat(),
+                "captured_at": time.perf_counter(),
                 "device_id": device_id,
             }
             self.data["_last_trigger"] = dict(self._last_trigger)
@@ -287,25 +324,68 @@ class GuardianCoordinator(DataUpdateCoordinator):
         # Notify HA that data changed — entities will see triggered state
         self.async_set_updated_data(self.data)
 
+    async def _handle_lost_session(self) -> None:
+        """Warn once, slow the polling down and tell the user to re-authenticate."""
+        if self._unauth_notified:
+            return
+        self._unauth_notified = True
+
+        _LOGGER.warning(
+            "No active session with the Guardian middleware — the alarm is no "
+            "longer being read. Re-authenticate from Settings -> Devices & "
+            "Services (a reconfigure card is now waiting there)."
+        )
+        self.update_interval = self._unauth_update_interval
+
+        await self.hass.services.async_call(
+            "persistent_notification",
+            "create",
+            {
+                "title": "Alarme sem comunicação",
+                "message": (
+                    "A sessão com a central Intelbras expirou e o Home Assistant "
+                    "parou de ler o alarme. Abra Configurações → Dispositivos e "
+                    "Serviços → Intelbras Guardian e conclua a reautenticação."
+                ),
+                "notification_id": f"{DOMAIN}_session_lost",
+            },
+            blocking=False,
+        )
+
+    async def _handle_session_restored(self) -> None:
+        """Undo what _handle_lost_session did once a session is back."""
+        if not self._unauth_notified:
+            return
+        self._unauth_notified = False
+
+        _LOGGER.info("Guardian session restored — resuming normal polling")
+        self.update_interval = self._normal_update_interval
+
+        await self.hass.services.async_call(
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": f"{DOMAIN}_session_lost"},
+            blocking=False,
+        )
+
     async def _async_update_data(self) -> Dict[str, Any]:
         """Fetch data from API."""
         try:
             # Check if we have a valid session
             if not self.client.session_id:
-                _LOGGER.warning(
-                    "No active session. Please re-authenticate via integration options."
-                )
+                await self._handle_lost_session()
                 # Stop SSE listener if session expired
                 await self.stop_sse_listener()
-                return {
-                    "devices": {},
-                    "partitions": [],
-                    "zones": [],
-                    "events": [],
-                    "new_events": [],
-                    "last_event": None,
-                    "needs_reauth": True,
-                }
+                # ConfigEntryAuthFailed (instead of returning empty data) makes
+                # HA start the reauth flow and mark the entities unavailable.
+                # Returning data used to leave the alarm panel showing its last
+                # known state — e.g. "disarmed" — while nothing was being read.
+                raise ConfigEntryAuthFailed(
+                    "Guardian middleware session expired; re-authentication required"
+                )
+
+            if self._unauth_notified:
+                await self._handle_session_restored()
 
             # Throttle cloud API calls (get_devices/get_events) to every
             # _cloud_api_interval seconds, while ISECNet status polls every cycle
@@ -317,17 +397,12 @@ class GuardianCoordinator(DataUpdateCoordinator):
                 self._cloud_api_counter = 0
                 devices = await self.client.get_devices()
                 if not devices:
-                    _LOGGER.warning("No devices found or session may be invalid")
                     await self.stop_sse_listener()
-                    return {
-                        "devices": {},
-                        "partitions": [],
-                        "zones": [],
-                        "events": [],
-                        "new_events": [],
-                        "last_event": None,
-                        "needs_reauth": True,
-                    }
+                    # UpdateFailed instead of empty data: the coordinator logs
+                    # it once (not once per second) and the entities become
+                    # unavailable rather than keeping a state nobody is
+                    # confirming any more.
+                    raise UpdateFailed("No devices returned by the middleware")
                 self._cached_devices = devices
                 self._cached_events = await self.client.get_events(limit=20)
             else:
@@ -487,6 +562,9 @@ class GuardianCoordinator(DataUpdateCoordinator):
                 # reading the trigger zone now sees the zone that actually
                 # fired. Only updated while triggered AND a zone is
                 # identifiable — never overwritten by routine events.
+                if processed_devices[device_id].get("is_triggered") and not prev_is_triggered:
+                    self._trigger_started_at.setdefault(device_id, time.perf_counter())
+
                 if processed_devices[device_id].get("is_triggered") and status_zones:
                     in_alarm = [z for z in status_zones if z.get("is_in_alarm")]
                     candidates = in_alarm or [
@@ -500,6 +578,7 @@ class GuardianCoordinator(DataUpdateCoordinator):
                             "zones": [z.get("name") for z in candidates],
                             "event_type": "Disparo de Setor",
                             "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "captured_at": time.perf_counter(),
                             "device_id": device_id,
                         }
 
@@ -639,6 +718,7 @@ class GuardianCoordinator(DataUpdateCoordinator):
                                         partition["status"] = device.get("arm_mode", "disarmed")
                             self._triggered_first_seen.pop(device_id, None)
                             self._phantom_trigger_since.pop(device_id, None)
+                            self._trigger_started_at.pop(device_id, None)
                             self._pre_trigger_arm_mode.pop(device_id, None)
                             self._pre_trigger_partition_status.pop(device_id, None)
                     else:
@@ -656,12 +736,14 @@ class GuardianCoordinator(DataUpdateCoordinator):
                                     if partition.get("status") == "triggered":
                                         partition["status"] = device.get("arm_mode", "disarmed")
                             self._triggered_first_seen.pop(device_id, None)
+                            self._trigger_started_at.pop(device_id, None)
                             self._pre_trigger_arm_mode.pop(device_id, None)
                             self._pre_trigger_partition_status.pop(device_id, None)
                 else:
                     # Cleanup snapshots once the device leaves the triggered state
                     self._triggered_first_seen.pop(device_id, None)
                     self._phantom_trigger_since.pop(device_id, None)
+                    self._trigger_started_at.pop(device_id, None)
                     self._pre_trigger_arm_mode.pop(device_id, None)
                     self._pre_trigger_partition_status.pop(device_id, None)
 
@@ -710,6 +792,11 @@ class GuardianCoordinator(DataUpdateCoordinator):
                 "_last_trigger": dict(self._last_trigger),
             }
 
+        except (ConfigEntryAuthFailed, UpdateFailed):
+            # Must escape the generic handler below: swallowing
+            # ConfigEntryAuthFailed here would stop HA from ever opening the
+            # reauth flow, and re-wrapping UpdateFailed only adds noise.
+            raise
         except Exception as err:
             _LOGGER.error(f"Error fetching data: {err}")
             raise UpdateFailed(f"Error communicating with API: {err}") from err
@@ -765,6 +852,10 @@ class GuardianCoordinator(DataUpdateCoordinator):
 
         except Exception as e:
             _LOGGER.debug(f"Could not refresh device {device_id}: {e}")
+
+    def trigger_started_at(self, device_id: int) -> Optional[float]:
+        """Return when the device's current trigger started (epoch), if any."""
+        return self._trigger_started_at.get(device_id)
 
     def get_device(self, device_id: int) -> Optional[Dict[str, Any]]:
         """Get a specific device from cached data."""

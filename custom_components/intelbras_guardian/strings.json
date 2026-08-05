@@ -15,6 +15,13 @@
         "data": {
           "callback_url": "Callback URL (paste the complete URL after login)"
         }
+      },
+      "reauth_confirm": {
+        "title": "Intelbras Guardian - Re-authenticate",
+        "description": "The session with the panel expired and the alarm is no longer being read. To restore it:\n\n1. Open the link below in your browser:\n\n**{auth_url}**\n\n2. Login with your Intelbras account\n\n3. The browser will try to open `localhost:8000` and fail — that is expected\n\n4. Copy the **complete URL** from the address bar (the one containing `code=` and `state=`) and paste below\n\nAPI: {api_url}",
+        "data": {
+          "callback_url": "Callback URL (paste the complete URL after login)"
+        }
       }
     },
     "error": {
@@ -25,7 +32,9 @@
       "unknown": "Unexpected error occurred."
     },
     "abort": {
-      "already_configured": "This API instance is already configured."
+      "already_configured": "This API instance is already configured.",
+      "reauth_successful": "Re-authentication complete. Communication with the alarm has been restored.",
+      "reauth_failed": "Could not re-authenticate: the integration entry was not found."
     }
   },
   "options": {

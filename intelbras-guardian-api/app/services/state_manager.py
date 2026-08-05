@@ -155,7 +155,13 @@ class InMemoryStateManager:
 
             for session_id in expired_tokens:
                 del self._tokens[session_id]
-                logger.debug(f"Cleaned up expired token: {session_id[:8]}...")
+                # WARNING, not debug: losing a token means every client of this
+                # session is now unauthenticated and only an interactive OAuth
+                # login can bring it back.
+                logger.warning(
+                    f"Session {session_id[:8]}... dropped: access token expired and "
+                    "was never refreshed. Re-authentication (OAuth) required."
+                )
 
             # Save if tokens were removed
             if expired_tokens:
@@ -216,6 +222,16 @@ class InMemoryStateManager:
                     pass
 
             return token_data.copy()
+
+    async def get_all_session_ids(self) -> list:
+        """
+        List every session that currently holds a token.
+
+        Used by the proactive refresh loop, which has no request context to
+        learn session ids from.
+        """
+        async with self._lock:
+            return list(self._tokens.keys())
 
     async def delete_token(self, session_id: str) -> None:
         """

@@ -5,11 +5,13 @@ on:
     branches: [main]
     paths:
       - "custom_components/**"
+      - "intelbras-guardian-api/**"
       - "tests/**"
       - ".github/workflows/ci.yaml"
   pull_request:
     paths:
       - "custom_components/**"
+      - "intelbras-guardian-api/**"
       - "tests/**"
       - ".github/workflows/ci.yaml"
 
@@ -34,7 +36,22 @@ jobs:
           custom_components/intelbras_guardian/api_client.py
           --ignore-missing-imports --follow-imports=skip
       - name: Unit tests (pure, no HA)
-        run: pytest tests/ --ignore=tests/integration -q
+        run: pytest tests/ --ignore=tests/integration --ignore=tests/middleware -q
+
+  middleware-test:
+    name: Middleware tests (FastAPI, no server)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install middleware deps
+        run: pip install pytest -r intelbras-guardian-api/requirements.txt
+      # Covers the OAuth token refresh — the path whose silent failure took
+      # the alarm offline on 2026-08-05.
+      - name: Middleware tests
+        run: pytest tests/middleware -q
 
   integration-test:
     name: Integration tests (HA mocked)
@@ -48,7 +65,24 @@ jobs:
         run: pip install pytest-homeassistant-custom-component
       # Drives the coordinator/entities with a mocked api_client and a
       # lightweight MagicMock hass; -p no:homeassistant disables the heavy
-      # autouse fixtures (event loop / socket guard) we don't use.
+      # autouse fixtures (event loop / socket guard) we don't use (also set
+      # in pytest.ini, kept here so the intent is visible in the log).
+      - name: Integration tests
+        run: pytest tests/integration -p no:homeassistant -q
+
+  integration-test-current-ha:
+    name: Integration tests (current HA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # The 3.11 job above pins HA 2024.3 (newer HA needs Python 3.13), which
+      # is two years behind what actually runs at home. This job catches API
+      # drift against the HA the integration is deployed on.
+      - name: Install current Home Assistant
+        run: pip install pytest homeassistant
       - name: Integration tests
         run: pytest tests/integration -p no:homeassistant -q
 

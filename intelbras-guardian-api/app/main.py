@@ -33,6 +33,10 @@ async def lifespan(app: FastAPI):
     # Start state manager cleanup task
     await state_manager.start_cleanup_task()
 
+    # Keep OAuth sessions alive (rotates the refresh token long before the
+    # access token expires — see AuthService.start_proactive_refresh_task)
+    await auth_service.start_proactive_refresh_task()
+
     # Start ISECNet client service
     await isecnet_client.start()
     logger.info("ISECNet client service started")
@@ -48,6 +52,9 @@ async def lifespan(app: FastAPI):
 
     # Stop cleanup task
     await state_manager.stop_cleanup_task()
+
+    # Stop proactive token refresh
+    await auth_service.stop_proactive_refresh_task()
 
     # Close HTTP sessions
     await auth_service.close()

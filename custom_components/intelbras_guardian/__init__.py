@@ -225,8 +225,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if not client.session_id:
         _LOGGER.warning(
-            "No valid session. Please re-authenticate via integration options "
-            "(Settings -> Devices & Services -> Intelbras Guardian -> Configure -> Re-authenticate)"
+            "No valid session. Home Assistant will ask for re-authentication "
+            "(Settings -> Devices & Services -> Intelbras Guardian)"
         )
         # We still set up the integration so user can re-authenticate
         # The coordinator will handle the missing session gracefully
@@ -241,10 +241,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         await coordinator.async_config_entry_first_refresh()
     except ConfigEntryAuthFailed:
-        _LOGGER.warning(
-            "Authentication required. Please use Options -> Re-authenticate"
-        )
-        # Don't raise - let the integration load so user can re-auth
+        # Don't raise: keeping the entry loaded means the alarm entities still
+        # exist (as unavailable) instead of vanishing from dashboards and
+        # automations. Start the reauth flow explicitly, since that is what
+        # raising would normally have done.
+        _LOGGER.warning("Authentication required — starting re-authentication flow")
+        entry.async_start_reauth(hass)
 
     # Set up platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

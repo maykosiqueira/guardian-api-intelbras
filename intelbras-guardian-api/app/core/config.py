@@ -74,6 +74,16 @@ class Settings(BaseSettings):
         default=300,
         description="Refresh token N seconds before expiration"
     )
+    TOKEN_PROACTIVE_REFRESH_INTERVAL: int = Field(
+        default=3600,
+        description=(
+            "Refresh every stored session this often (seconds), regardless of "
+            "access-token expiry. The Intelbras (WSO2) refresh token has a much "
+            "shorter validity than the access token, so waiting for "
+            "TOKEN_REFRESH_BUFFER means refreshing with an already-dead refresh "
+            "token. 0 disables the proactive loop."
+        )
+    )
     EVENT_POLL_INTERVAL: int = Field(
         default=30,
         description="Event polling interval in seconds"

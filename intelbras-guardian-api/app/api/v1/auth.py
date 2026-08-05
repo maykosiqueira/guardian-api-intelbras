@@ -10,7 +10,12 @@ from pydantic import BaseModel, EmailStr, Field
 from typing import Optional
 
 from app.services.auth_service import auth_service
-from app.core.exceptions import AuthenticationError, InvalidSessionError
+from app.services.state_manager import state_manager
+from app.core.exceptions import (
+    AuthenticationError,
+    InvalidSessionError,
+    TokenRefreshError,
+)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -112,6 +117,31 @@ async def get_session(x_session_id: str = Header(..., alias="X-Session-ID")):
         return SessionResponse(**info)
     except InvalidSessionError as e:
         raise HTTPException(status_code=401, detail=str(e.message))
+
+
+@router.post("/refresh")
+async def refresh_session(x_session_id: str = Header(..., alias="X-Session-ID")):
+    """
+    Force a token refresh for this session.
+
+    Same call the proactive refresh loop makes; exposed so the rotation can be
+    verified on demand instead of waiting for the next cycle.
+    """
+    token_data = await state_manager.get_token(x_session_id)
+    if not token_data:
+        raise HTTPException(status_code=404, detail="Session not found")
+    try:
+        updated = await auth_service._refresh_token(x_session_id, token_data)
+        return {
+            "success": True,
+            "expires_at": updated.get("expires_at"),
+            "expires_in": updated.get("expires_in"),
+            "refresh_token_rotated": (
+                updated.get("refresh_token") != token_data.get("refresh_token")
+            ),
+        }
+    except TokenRefreshError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 # ==================== OAuth PKCE Endpoints ====================
