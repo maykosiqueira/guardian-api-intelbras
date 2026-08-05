@@ -1119,6 +1119,12 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
         async def _execute_arm_home():
             device_lock = _get_device_command_lock(self._device_id)
             async with device_lock:
+                # Consume the flag here too. This path arms partition by
+                # partition (the panel itself decides on open zones), but
+                # leaving it set would silently skip the pre-check on the next
+                # away arm.
+                self._skip_open_zone_check = False
+
                 all_success = True
                 errors = []
                 open_zones_all = []
@@ -1231,8 +1237,14 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
                 if idxs and len(target_modes) == 1:
                     mode = next(iter(target_modes))
                     try:
+                        # skip_check also has to reach the server: its pre-check
+                        # reads the same status frame, which carries no bypass
+                        # bitmap, so a zone bypassed a moment ago still counts
+                        # as open and the "Ignorar Zonas e Armar" retry would
+                        # be refused exactly like the first attempt.
                         result = await self.coordinator.client.arm_partitions_multi(
-                            self._device_id, idxs, mode=mode
+                            self._device_id, idxs, mode=mode,
+                            ignore_open_zones=skip_check,
                         )
                     except Exception as e:  # noqa: BLE001
                         result = {"success": False, "error": str(e)}

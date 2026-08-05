@@ -51,6 +51,16 @@ class ArmMultiRequest(BaseModel):
     mode: ArmMode = Field(default=ArmMode.AWAY, description="Arm mode: away (total) or home (stay)")
     password: Optional[str] = Field(None, min_length=4, max_length=6, description="Alarm panel password (4-6 digits). If not provided, uses saved password.")
     save_password: bool = Field(default=False, description="Save password for future use")
+    ignore_open_zones: bool = Field(
+        default=False,
+        description=(
+            "Skip the open-zone pre-check. Required after bypassing zones: the "
+            "ISECNet status frame never reports the bypass bitmap, so a zone "
+            "that was just bypassed still reads as open and the pre-check would "
+            "refuse forever. The panel remains the final authority — it rejects "
+            "the arm command itself if a non-bypassed zone is open."
+        )
+    )
 
 
 class PartitionArmResult(BaseModel):
@@ -699,7 +709,15 @@ async def arm_partitions_atomic(
             target_partitions = [None]  # None -> protocol omits partition byte
 
         # Open-zone pre-check (all-or-nothing). Reuse the status we already fetched.
-        open_zones = await _open_zones_from_status(device_id, status)
+        # Skipped on an explicit force-arm: the caller has just bypassed the open
+        # zones, and since the status frame carries no bypass bitmap they would
+        # still look open here, making the retry fail exactly like the first try.
+        open_zones = [] if request.ignore_open_zones else await _open_zones_from_status(device_id, status)
+        if request.ignore_open_zones:
+            logger.info(
+                f"Atomic arm for device {device_id} with ignore_open_zones=True "
+                "(force-arm after bypass); the panel decides"
+            )
         if open_zones:
             logger.warning(
                 f"Atomic arm aborted for device {device_id}: {len(open_zones)} open zone(s), nothing armed"

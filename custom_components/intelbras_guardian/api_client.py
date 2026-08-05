@@ -256,7 +256,8 @@ class GuardianApiClient:
         self,
         device_id: int,
         partition_indices: List[int],
-        mode: str = "away"
+        mode: str = "away",
+        ignore_open_zones: bool = False,
     ) -> ArmResult:
         """Atomically arm multiple partitions (all-or-nothing).
 
@@ -267,15 +268,22 @@ class GuardianApiClient:
         Args:
             partition_indices: 0-based partition indices.
             mode: "away" (total) or "home" (stay) — applied to all partitions.
+            ignore_open_zones: skip the server pre-check. Set only right after
+                bypassing the open zones: the status frame has no bypass
+                bitmap, so those zones still read as open and the pre-check
+                would refuse the retry forever.
 
         Returns:
             Dict with 'success' (bool); on failure 'error' (str) and
             optionally 'open_zones' (list).
         """
+        payload: Dict[str, Any] = {"partitions": partition_indices, "mode": mode}
+        if ignore_open_zones:
+            payload["ignore_open_zones"] = True
         return cast(ArmResult, await self._request_with_error(
             "POST",
             f"/api/v1/alarm/{device_id}/arm-multi",
-            {"partitions": partition_indices, "mode": mode}
+            payload
         ))
 
     async def disarm_partition(
