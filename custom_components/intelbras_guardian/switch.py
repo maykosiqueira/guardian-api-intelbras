@@ -1,4 +1,5 @@
 """Switch platform for Intelbras Guardian eletrificadores."""
+import asyncio
 import logging
 from typing import Any
 
@@ -15,6 +16,18 @@ from .const import DOMAIN, ELETRIFICADOR_MODELS
 from .coordinator import GuardianCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+# hass.data[DOMAIN] key holding, per alarm device, the zone bypass switches and
+# the lock that serializes the commands they send. See GuardianZoneBypassSwitch.
+ZONE_BYPASS_KEY = "zone_bypass"
+
+
+def _bypass_registry(hass: HomeAssistant, device_id: int) -> dict:
+    """Return the shared bypass state for one alarm device."""
+    registry = hass.data.setdefault(DOMAIN, {}).setdefault(ZONE_BYPASS_KEY, {})
+    return registry.setdefault(
+        device_id, {"lock": asyncio.Lock(), "switches": {}}
+    )
 
 
 def is_eletrificador(device: dict) -> bool:
@@ -114,6 +127,9 @@ class GuardianZoneBypassSwitch(CoordinatorEntity, SwitchEntity, RestoreEntity):
     reflects the last command sent from Home Assistant and is restored across
     restarts. The panel clears bypasses on its own arm/disarm cycle, so scripts
     should re-assert the bypass right before arming and clear it on disarm.
+
+    Every command carries the whole set of zones this device wants bypassed,
+    not just the zone that changed - see `_async_set_bypass` for why.
     """
 
     _attr_has_entity_name = True
@@ -138,11 +154,20 @@ class GuardianZoneBypassSwitch(CoordinatorEntity, SwitchEntity, RestoreEntity):
         self._attr_unique_id = f"{device_mac}_zone_{zone_index}_bypass"
 
     async def async_added_to_hass(self) -> None:
-        """Restore the last known bypass state."""
+        """Restore the last known bypass state and join the device's set."""
         await super().async_added_to_hass()
         last_state = await self.async_get_last_state()
         if last_state is not None and last_state.state == "on":
             self._is_bypassed = True
+        registry = _bypass_registry(self.hass, self._device_id)
+        registry["switches"][self._zone_index] = self
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Leave the device's bypass set so a stale entity is not counted."""
+        switches = _bypass_registry(self.hass, self._device_id)["switches"]
+        if switches.get(self._zone_index) is self:
+            del switches[self._zone_index]
+        await super().async_will_remove_from_hass()
 
     @property
     def name(self) -> str:
@@ -203,28 +228,74 @@ class GuardianZoneBypassSwitch(CoordinatorEntity, SwitchEntity, RestoreEntity):
             "panel_reports_bypassed": zone.get("is_bypassed", False),
         }
 
-    async def _async_set_bypass(self, bypass: bool) -> None:
-        """Send the bypass command to the panel."""
+    def _desired_zones(self, bypass: bool) -> set[int]:
+        """Return every zone of this device that should end up bypassed."""
+        desired = {
+            index
+            for index, switch in _bypass_registry(
+                self.hass, self._device_id
+            )["switches"].items()
+            if switch is not self and switch.is_on
+        }
+        if bypass:
+            desired.add(self._zone_index)
+        else:
+            desired.discard(self._zone_index)
+        return desired
+
+    async def _async_send(self, zone_indices: list[int], bypass: bool) -> None:
+        """Send one bypass command, raising if the panel does not take it."""
         result = await self.coordinator.client.bypass_zones(
-            self._device_id, [self._zone_index], bypass=bypass
+            self._device_id, zone_indices, bypass=bypass
         )
         if result and result.get("success"):
+            return
+        error = (result or {}).get("error", "sem resposta")
+        _LOGGER.error(
+            "Failed to %s zone %d on device %s (sent zones %s): %s",
+            "bypass" if bypass else "unbypass",
+            self._zone_index + 1,
+            self._device_id,
+            [index + 1 for index in zone_indices],
+            error,
+        )
+        raise HomeAssistantError(
+            f"Falha ao {'anular' if bypass else 'reativar'} a zona "
+            f"{self._zone_index + 1:02d}: {error}"
+        )
+
+    async def _async_set_bypass(self, bypass: bool) -> None:
+        """Send the bypass command to the panel.
+
+        The command has to carry every zone that should stay bypassed, because
+        on ISECNet V1 panels (AMT 2018 E SMART and friends) bypass is a
+        FULL-STATE bitmask of all 48 zones: the zones left out of the request
+        are actively un-bypassed. One command per zone therefore made each
+        command wipe the one before it, and since Home Assistant runs a
+        multi-entity `switch.turn_on` concurrently, only whichever command
+        reached the panel last survived. A script bypassing four zones before
+        arming silently ended up with a single one bypassed - and the panel
+        refused to arm if one of the others was open.
+
+        The commands are serialized per device and the set is recomputed
+        inside the lock, so concurrent calls converge on the full set instead
+        of racing. Turning a zone off also sends an explicit un-bypass for
+        that zone first: on V2 panels the command is per-zone and omitting a
+        zone means "leave it alone", so the full-set command alone would never
+        clear it. On V1 that first command is a harmless all-zeros bitmask
+        which the second one immediately corrects.
+        """
+        registry = _bypass_registry(self.hass, self._device_id)
+        async with registry["lock"]:
+            desired = self._desired_zones(bypass)
+            if not bypass:
+                await self._async_send([self._zone_index], False)
+            if desired:
+                await self._async_send(sorted(desired), True)
             self._is_bypassed = bypass
-            self.async_write_ha_state()
-            await self.coordinator.async_refresh_device(self._device_id)
-        else:
-            error = (result or {}).get("error", "sem resposta")
-            _LOGGER.error(
-                "Failed to %s zone %d on device %s: %s",
-                "bypass" if bypass else "unbypass",
-                self._zone_index + 1,
-                self._device_id,
-                error,
-            )
-            raise HomeAssistantError(
-                f"Falha ao {'anular' if bypass else 'reativar'} a zona "
-                f"{self._zone_index + 1:02d}: {error}"
-            )
+
+        self.async_write_ha_state()
+        await self.coordinator.async_refresh_device(self._device_id)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Bypass (anular) the zone."""
