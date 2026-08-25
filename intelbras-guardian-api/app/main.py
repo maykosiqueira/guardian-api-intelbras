@@ -50,8 +50,9 @@ async def lifespan(app: FastAPI):
     await isecnet_client.stop()
     logger.info("ISECNet client service stopped")
 
-    # Stop cleanup task
+    # Stop cleanup task and write whatever is still pending to disk
     await state_manager.stop_cleanup_task()
+    await state_manager.flush()
 
     # Stop proactive token refresh
     await auth_service.stop_proactive_refresh_task()

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 from pathlib import Path
 import asyncio
+import time
 
 from app.core.config import settings
 
@@ -40,6 +41,20 @@ class InMemoryStateManager:
         self._conn_info_ttl = 300  # Connection info TTL in seconds (5 minutes)
         self._cleanup_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
+        # Disk persistence is decoupled from the request path. `_save_sessions`
+        # used to run json.dump + fsync + rename synchronously inside the event
+        # loop on every status poll (1 Hz). On a slow SD card that froze the
+        # whole middleware for 10-40 s dozens of times a day, and every freeze
+        # longer than the Home Assistant client timeout (30 s) made HA report
+        # every open zone as closed. Writers now only mark the state dirty; one
+        # background task snapshots it under the lock and writes it in a worker
+        # thread, coalescing bursts and throttling the once-per-second status.
+        self._persist_task: Optional[asyncio.Task] = None
+        self._persist_dirty = False
+        self._persist_due = 0.0
+        self._persist_delay = 1.0             # coalesce token/password bursts
+        self._status_persist_interval = 60.0  # last_known_status changes every poll
+        self._last_status_persist = 0.0
         # Load persisted sessions on startup
         self._load_sessions()
 
@@ -68,26 +83,97 @@ class InMemoryStateManager:
             self._zone_friendly_names = {}
             self._last_known_status = {}
 
-    def _save_sessions(self) -> None:
-        """Save sessions to file using atomic write (temp + rename).
+    def _snapshot(self) -> Dict[str, Any]:
+        """Deep-copy the persisted state (call with the lock held)."""
+        # Convert zone friendly names int keys to string for JSON
+        zone_names_serializable = {}
+        for device_id, zones in self._zone_friendly_names.items():
+            zone_names_serializable[device_id] = {str(k): v for k, v in zones.items()}
 
-        This prevents data corruption if the process crashes during write.
+        data = {
+            "tokens": self._tokens,
+            "device_passwords": self._device_passwords,
+            "zone_friendly_names": zone_names_serializable,
+            "last_known_status": self._last_known_status,
+        }
+        # json round-trip = deep copy, so the writer thread never races
+        # with the event loop mutating these dicts.
+        return json.loads(json.dumps(data))
+
+    def _save_sessions(self) -> None:
+        """Write the current state to disk synchronously.
+
+        Only for shutdown / no-event-loop contexts. Request handlers must use
+        `_request_persist`, which does the write in a worker thread.
         """
+        self._write_snapshot(self._snapshot())
+
+    def _request_persist(self, delay: Optional[float] = None) -> None:
+        """Schedule a background write of the persisted state.
+
+        Cheap to call from the request path (with or without the lock): it
+        only marks the state dirty and, if no writer is due sooner, starts one
+        that sleeps `delay` seconds, snapshots the state under the lock and
+        writes it in a worker thread. A pending writer with a later deadline
+        is replaced by an earlier one.
+        """
+        if delay is None:
+            delay = self._persist_delay
+        self._persist_dirty = True
+        due = time.monotonic() + delay
+        task = self._persist_task
+        if task is not None and not task.done():
+            if due >= self._persist_due:
+                return
+            task.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No event loop (sync caller): write inline as before.
+            self._persist_dirty = False
+            self._save_sessions()
+            return
+        self._persist_due = due
+        self._persist_task = loop.create_task(self._persist_later(delay))
+
+    async def _persist_later(self, delay: float) -> None:
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._persist_dirty = False
+            async with self._lock:
+                data = self._snapshot()
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._write_snapshot, data)
+            self._last_status_persist = time.monotonic()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Background persist failed: {e}")
+
+    async def flush(self) -> None:
+        """Write any pending state now (used at shutdown)."""
+        task = self._persist_task
+        self._persist_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._persist_dirty = True  # the cancelled writer may not have finished
+        if self._persist_dirty:
+            self._persist_dirty = False
+            async with self._lock:
+                data = self._snapshot()
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._write_snapshot, data)
+
+    def _write_snapshot(self, data: Dict[str, Any]) -> None:
+        """Atomic write (temp + fsync + rename). Runs in a worker thread."""
         try:
             # Ensure data directory exists
             SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-            # Convert zone friendly names int keys to string for JSON
-            zone_names_serializable = {}
-            for device_id, zones in self._zone_friendly_names.items():
-                zone_names_serializable[device_id] = {str(k): v for k, v in zones.items()}
-
-            data = {
-                "tokens": self._tokens,
-                "device_passwords": self._device_passwords,
-                "zone_friendly_names": zone_names_serializable,
-                "last_known_status": self._last_known_status
-            }
 
             # Atomic write: write to temp file first, then rename
             temp_file = SESSIONS_FILE.with_suffix('.tmp')
@@ -101,7 +187,7 @@ class InMemoryStateManager:
 
                 # Atomic rename (on most systems, rename is atomic)
                 temp_file.replace(SESSIONS_FILE)
-                logger.debug(f"Saved {len(self._tokens)} sessions to file (atomic)")
+                logger.debug(f"Saved {len(data.get('tokens', {}))} sessions to file (atomic)")
             except Exception as e:
                 # Clean up temp file on failure
                 if temp_file.exists():
@@ -167,7 +253,7 @@ class InMemoryStateManager:
 
             # Save if tokens were removed
             if expired_tokens:
-                self._save_sessions()
+                self._request_persist()
 
             # Cleanup expired device state
             expired_states = []
@@ -197,7 +283,7 @@ class InMemoryStateManager:
         """
         async with self._lock:
             self._tokens[session_id] = token_data.copy()
-            self._save_sessions()  # Persist to file
+            self._request_persist()
             logger.debug(f"Stored token for session: {session_id[:8]}...")
 
     async def get_token(self, session_id: str) -> Optional[Dict[str, Any]]:
@@ -245,7 +331,7 @@ class InMemoryStateManager:
         async with self._lock:
             if session_id in self._tokens:
                 del self._tokens[session_id]
-                self._save_sessions()  # Persist to file
+                self._request_persist()
                 logger.debug(f"Deleted token for session: {session_id[:8]}...")
 
     # Device state management
@@ -365,7 +451,7 @@ class InMemoryStateManager:
         """
         async with self._lock:
             self._device_passwords[str(device_id)] = password
-            self._save_sessions()
+            self._request_persist()
             logger.debug(f"Stored password for device {device_id}")
 
     async def get_device_password(self, session_id: str, device_id: str) -> Optional[str]:
@@ -393,7 +479,7 @@ class InMemoryStateManager:
         async with self._lock:
             if str(device_id) in self._device_passwords:
                 del self._device_passwords[str(device_id)]
-                self._save_sessions()
+                self._request_persist()
                 logger.debug(f"Deleted password for device {device_id}")
 
     async def get_all_device_passwords(self, session_id: str) -> Dict[str, str]:
@@ -536,7 +622,7 @@ class InMemoryStateManager:
             if key not in self._zone_friendly_names:
                 self._zone_friendly_names[key] = {}
             self._zone_friendly_names[key][zone_index] = friendly_name
-            self._save_sessions()
+            self._request_persist()
             logger.debug(f"Set zone {zone_index} friendly_name='{friendly_name}' for device {device_id}")
 
     async def get_zone_friendly_name(self, device_id: int, zone_index: int) -> Optional[str]:
@@ -582,7 +668,7 @@ class InMemoryStateManager:
             key = str(device_id)
             if key in self._zone_friendly_names and zone_index in self._zone_friendly_names[key]:
                 del self._zone_friendly_names[key][zone_index]
-                self._save_sessions()
+                self._request_persist()
                 logger.debug(f"Deleted zone {zone_index} friendly_name for device {device_id}")
 
     # Last known status management (persistent cache for connection failures)
@@ -603,8 +689,11 @@ class InMemoryStateManager:
             status_copy = status_data.copy()
             status_copy["_last_updated"] = datetime.utcnow().isoformat()
             self._last_known_status[key] = status_copy
-            self._save_sessions()
-            logger.debug(f"Saved last known status for device {device_id}: arm_mode={status_data.get('arm_mode')}")
+            logger.debug(f"Cached last known status for device {device_id}: arm_mode={status_data.get('arm_mode')}")
+        # Status arrives once per second; persist it at most every
+        # `_status_persist_interval` seconds, always in the background.
+        elapsed = time.monotonic() - self._last_status_persist
+        self._request_persist(max(0.0, self._status_persist_interval - elapsed))
 
     async def get_last_known_status(self, device_id: int) -> Optional[Dict[str, Any]]:
         """
@@ -636,7 +725,7 @@ class InMemoryStateManager:
             key = str(device_id)
             if key in self._last_known_status:
                 del self._last_known_status[key]
-                self._save_sessions()
+                self._request_persist()
                 logger.debug(f"Deleted last known status for device {device_id}")
 
 
