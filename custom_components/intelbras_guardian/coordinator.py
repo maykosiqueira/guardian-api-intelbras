@@ -115,6 +115,10 @@ class GuardianCoordinator(DataUpdateCoordinator):
         # Previous zone open states for edge detection (zone events)
         self._prev_zone_open: Dict[tuple, bool] = {}
 
+        # Consecutive status polls per device that failed or came back
+        # without zones (the previous cycle's state is kept meanwhile).
+        self._stale_status_polls: Dict[int, int] = {}
+
         # Cloud API throttle: only fetch devices/events every N cycles
         self._cloud_api_interval = 30  # seconds
         self._cloud_api_counter = 0
@@ -445,6 +449,7 @@ class GuardianCoordinator(DataUpdateCoordinator):
                 # Try to get real-time status using auto-sync (uses saved password)
                 # This now also returns zones, eliminating need for separate /zones call
                 status_zones = []
+                status = None
                 if device.get("has_saved_password"):
                     try:
                         status = await self.client.get_alarm_status_auto(device_id)
@@ -553,6 +558,46 @@ class GuardianCoordinator(DataUpdateCoordinator):
                                 status_zones = status.get("zones", [])
                     except Exception as e:
                         _LOGGER.debug(f"Could not get real-time status for device {device_id}: {e}")
+
+                # A failed or empty status poll must never be rendered as
+                # "every zone closed". Until 2026-08-25 a middleware stall
+                # longer than the api_client timeout (status None) or a 200
+                # with an empty zone list fell through to the cloud zone list
+                # below, which carries no `is_open`/`signal_strength`: every
+                # open zone flipped to closed and every wireless signal to
+                # unknown for 1-15 s, several times a day. Keep the previous
+                # cycle's real-time state instead and say so once per episode.
+                if device.get("has_saved_password") and not status_zones:
+                    prev_zones = [
+                        z for z in (self.data or {}).get("zones", [])
+                        if z.get("device_id") == device_id
+                    ]
+                    if prev_zones:
+                        status_zones = prev_zones
+                        if status is None:
+                            # Nothing came back at all: keep the arm state and
+                            # the partition statuses from the previous cycle too.
+                            for field in ("arm_mode", "is_armed", "is_triggered"):
+                                if field in prev_device_data:
+                                    processed_devices[device_id][field] = prev_device_data[field]
+                            device_partitions_list = device.get("partitions", [])
+                            for p_idx, prev_status in prev_partition_statuses.items():
+                                if p_idx < len(device_partitions_list):
+                                    device_partitions_list[p_idx]["status"] = prev_status
+                        stale = self._stale_status_polls.get(device_id, 0) + 1
+                        self._stale_status_polls[device_id] = stale
+                        if stale == 1:
+                            _LOGGER.warning(
+                                "Device %s: status poll %s; keeping the last known zone/partition state",
+                                device_id,
+                                "failed" if status is None else "returned no zones",
+                            )
+                elif status_zones:
+                    stale = self._stale_status_polls.pop(device_id, 0)
+                    if stale:
+                        _LOGGER.info(
+                            "Device %s: real-time status back after %d stale poll(s)", device_id, stale
+                        )
 
                 # Capture the triggering zone SYNCHRONOUSLY with is_triggered,
                 # straight from the zone(s) the central reports as in-alarm.

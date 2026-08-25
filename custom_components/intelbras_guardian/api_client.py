@@ -184,11 +184,16 @@ class GuardianApiClient:
                     _LOGGER.error(f"API error {response.status}: {error}")
                     return None
 
+        except asyncio.TimeoutError:
+            # str(TimeoutError()) is empty - the old "Request error: " line
+            # gave no clue that the middleware had simply stalled.
+            _LOGGER.error(f"Request timed out after {self._timeout}s: {method} {endpoint}")
+            return None
         except aiohttp.ClientError as e:
-            _LOGGER.error(f"Connection error: {e}")
+            _LOGGER.error(f"Connection error on {method} {endpoint}: {e}")
             return None
         except Exception as e:
-            _LOGGER.error(f"Request error: {e}")
+            _LOGGER.error(f"Request error on {method} {endpoint}: {type(e).__name__}: {e}")
             return None
 
     async def get_devices(self) -> List[Dict[str, Any]]:
