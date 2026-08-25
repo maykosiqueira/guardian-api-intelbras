@@ -118,6 +118,10 @@ class AlarmStatus:
     zone_battery_low: List[int] = None    # Indices of zones with low battery
     zone_signal: dict = None              # {zone_index: signal_value (0-10)}
     zone_tamper: List[int] = None         # Indices of zones with tamper
+    # False when the reply could not be parsed (short/invalid frame). An
+    # empty AlarmStatus() used to be returned as a *successful* status,
+    # which downstream rendered as "every zone closed".
+    is_valid: bool = True
 
     def __post_init__(self):
         if self.partitions is None:
@@ -790,6 +794,7 @@ class ISECNetProtocol:
         valid, data = self._parse_isecv1_response(response)
         if not valid or len(data) < 10:
             logger.warning(f"ISECNet V1 status response invalid or too short: {len(data)} bytes")
+            status.is_valid = False
             return status
 
         logger.debug(f"ISECNet V1 status data ({len(data)} bytes): {bytes(data).hex()}")
@@ -807,6 +812,7 @@ class ISECNetProtocol:
         # Check if we have full partial status response (46 bytes total = 44 data bytes)
         if len(data) < 40:
             logger.warning(f"Response too short for partial status parsing: {len(data)} bytes")
+            status.is_valid = False
             return status
 
         # Model code at data[19] (APK bytes[20])
@@ -1268,6 +1274,7 @@ class ISECNetProtocol:
                     self.reader.read(1024),
                     timeout=timeout
                 )
+                response = await self._complete_v1_frame(response)
                 logger.debug(f"Received: {response.hex() if response else 'empty'}")
                 return response
 
@@ -1281,6 +1288,43 @@ class ISECNetProtocol:
                 return None
 
         return None
+
+    async def _complete_v1_frame(self, response: bytes, timeout: float = 2.0) -> bytes:
+        """Finish reading a V1 frame that arrived split across TCP segments.
+
+        V1 replies are [size][data...][checksum]. A single `read(1024)` returns
+        whatever the relay has delivered so far - on 2026-08-25 that was the
+        size byte alone, which the status parser turned into an empty status
+        (every zone closed) and the next command then read the leftover 200
+        bytes as its own reply. Keep reading until `size + 2` bytes are in
+        hand or `timeout` expires; a genuinely short reply is returned as is
+        for the parsers to reject.
+        """
+        if not (self._is_v1 or self._is_ip_receiver) or not response:
+            return response
+        expected = response[0] + 2
+        if len(response) >= expected:
+            return response
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        buf = bytearray(response)
+        while len(buf) < expected:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning(f"V1 frame still incomplete after {timeout}s: {len(buf)}/{expected} bytes")
+                break
+            try:
+                chunk = await asyncio.wait_for(self.reader.read(expected - len(buf)), timeout=remaining)
+            except asyncio.TimeoutError:
+                logger.warning(f"V1 frame still incomplete after {timeout}s: {len(buf)}/{expected} bytes")
+                break
+            if not chunk:
+                logger.warning(f"Connection closed mid-frame: {len(buf)}/{expected} bytes")
+                break
+            buf.extend(chunk)
+        if len(buf) > len(response):
+            logger.info(f"V1 frame reassembled from {len(response)} to {len(buf)} bytes")
+        return bytes(buf)
 
     def _parse_source_id(self, response: bytes) -> List[int]:
         """Parse source ID from response."""
@@ -1448,6 +1492,7 @@ class ISECNetProtocol:
 
         if len(response) < 32:
             logger.warning(f"Status response too short: {len(response)} bytes")
+            status.is_valid = False
             return status
 
         # Parse model (byte 8 for single-byte model code)
@@ -1860,6 +1905,12 @@ class ISECNetProtocol:
 
                     logger.debug(f"V1 Status response ({len(response)} bytes): {response.hex()}")
                     status = self._parse_isecv1_status_response(response)
+                    if not status.is_valid:
+                        logger.warning(
+                            f"V1 status reply unusable ({len(response)} bytes) - reporting failure "
+                            "so the caller keeps the last known state"
+                        )
+                        return False, status
                     return True, status
                 else:
                     # ISECNet V2 mode (Cloud)
@@ -1878,6 +1929,12 @@ class ISECNetProtocol:
                         return False, AlarmStatus()
 
                     status = self._parse_status_response(response)
+                    if not status.is_valid:
+                        logger.warning(
+                            f"V2 status reply unusable ({len(response)} bytes) - reporting failure "
+                            "so the caller keeps the last known state"
+                        )
+                        return False, status
                     return True, status
 
             except Exception as e:
