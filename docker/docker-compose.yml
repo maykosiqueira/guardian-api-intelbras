@@ -23,6 +23,13 @@ services:
       # Persist session data
       - intelbras-data:/app/data
     restart: unless-stopped
+    # ~10 INFO lines/s (raw ISECNet frames) with the default json-file driver
+    # grew past 11 GB on one install and 100 GB on another. Keep ~250 MB.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
       interval: 30s
