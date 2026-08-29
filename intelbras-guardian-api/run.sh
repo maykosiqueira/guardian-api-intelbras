@@ -3,7 +3,7 @@
 # Intelbras Guardian API Add-on
 # ==============================================================================
 
-REPO_URL="https://github.com/bobaoapae/guardian-api-intelbras"
+REPO_URL="https://github.com/maykosiqueira/guardian-api-intelbras"
 
 # Read configuration from options.json if it exists
 CONFIG_PATH=/data/options.json
