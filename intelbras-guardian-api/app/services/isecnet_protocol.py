@@ -1211,19 +1211,30 @@ class ISECNetProtocol:
         # Check status response formats FIRST (46-byte or 96+ byte responses
         # contain response[2]=0x00 meaning success, not error)
         # 46-byte response = partial status response = success
+        # Both shapes of reply open with the 0xE9 echo, so only the length
+        # tells them apart. A refusal or an ack is 4 bytes and carries its code
+        # in response[2] - captured from an ANM 24 Net G2: 02 e9 e4 f0 for open
+        # zones, 02 e9 fe ea for success, checksums confirming the framing. A
+        # status dump instead answers with the panel's whole state, where
+        # response[2] is the first zone-open bitmap byte; matching THAT against
+        # the code table turns any open-zone pattern landing on 0xE0-0xE8/0xFF
+        # into a failure that never happened - 0xE7 (zones 1,2,3,6,7,8 open)
+        # reports "Deactivation denied" on every arm and disarm while the panel
+        # obeys the command. The dump was only recognised at exactly 46 bytes,
+        # but the ANM 24 Net G2 sends 56, so on that panel every reply took the
+        # wrong path.
+        if len(response) >= 40 and response[1] == 0xE9:
+            logger.debug(f"{len(response)}-byte status echo - command succeeded")
+            return True, "OK"
+
         if len(response) == 46:
-            # Check for actual error codes even in 46-byte responses
             if len(response) >= 3 and response[2] in error_codes:
                 error_msg = error_codes[response[2]]
                 logger.warning(f"ISECNet V1 command failed: {error_msg} (0x{response[2]:02X})")
                 return False, error_msg
 
-            if response[1] == 0xE9:
-                logger.debug("46-byte response (partial status) - command succeeded")
-                return True, "OK"
-            else:
-                logger.warning(f"46-byte response but unexpected format: byte[1]=0x{response[1]:02X}")
-                return True, "OK"
+            logger.warning(f"46-byte response but unexpected format: byte[1]=0x{response[1]:02X}")
+            return True, "OK"
 
         # 96+ bytes = complete status response = success
         if len(response) >= 96:
