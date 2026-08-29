@@ -901,7 +901,15 @@ class ISECNetProtocol:
         partitions = []
         num_partitions = self._get_max_partitions_for_model(model_code)
 
-        for i in range(num_partitions):
+        # A model the APK reports as having no partitions (ANM 24 Net, ANM 24
+        # Net G2, AMT 1000 Smart) still announces whether the system is armed
+        # in bit 0 of the armed byte, so read it as one logical partition.
+        # Looping over the raw count left the list empty for those panels and
+        # the block below then kept arm_mode at its "disarmed" default however
+        # the panel was really set. Measured on an ANM 24 Net G2: data[22]
+        # goes 0x00 -> 0x03 the moment the panel arms, and the middleware kept
+        # answering "disarmed" for every poll in between.
+        for i in range(num_partitions or 1):
             if model_code == 65 and i >= 2:  # AMT_4010 partitions C,D in next byte
                 is_armed = bool(data[armed_offset + 1] & (1 << (i - 2)))
             else:
@@ -920,13 +928,6 @@ class ISECNetProtocol:
                 "armed": is_armed
             })
             logger.info(f"Partition {i}: armed={is_armed}, state={state}")
-
-        # If no partitions detected from bits, check if single partition mode
-        if not any(p["armed"] for p in partitions) and partition_enabled == 0:
-            # Single partition mode - check if overall system is armed
-            # In this case partition_status_byte may be 0 even when armed
-            # Check additional status indicators
-            pass
 
         status.partitions = partitions
 
