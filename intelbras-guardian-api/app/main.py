@@ -8,17 +8,24 @@ from contextlib import asynccontextmanager
 import logging
 
 from app.core.config import settings
-from app.core.exceptions import GuardianBaseException
-from app.api.v1 import api_router
-from app.services import state_manager, auth_service, guardian_client
-from app.services.isecnet_client import isecnet_client
 
-# Configure logging
+# Configure logging BEFORE importing the services. `state_manager` builds its
+# singleton at import time, and that constructor is what loads the persisted
+# sessions - so everything it reports about the state it found (or failed to
+# find) was written to a root logger that still had no handler and sat at the
+# default WARNING level. The one line that answers "did this install keep its
+# login?" was discarded on every boot, which is exactly the diagnosis nobody
+# could make.
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper()),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+from app.core.exceptions import GuardianBaseException  # noqa: E402
+from app.api.v1 import api_router  # noqa: E402
+from app.services import state_manager, auth_service, guardian_client  # noqa: E402
+from app.services.isecnet_client import isecnet_client  # noqa: E402
 
 
 @asynccontextmanager

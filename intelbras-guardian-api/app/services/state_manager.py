@@ -92,7 +92,13 @@ class InMemoryStateManager:
                         self._zone_friendly_names[device_id] = {int(k): v for k, v in zones.items()}
                     # Load last known status (persistent cache for connection failures)
                     self._last_known_status = data.get("last_known_status", {})
-                    logger.info(f"Loaded {len(self._tokens)} sessions, {len(self._device_passwords)} device passwords, {len(self._zone_friendly_names)} zone configs, {len(self._last_known_status)} last known statuses from file")
+                    logger.info(f"Loaded {len(self._tokens)} sessions, {len(self._device_passwords)} device passwords, {len(self._zone_friendly_names)} zone configs, {len(self._last_known_status)} last known statuses from {source}")
+            else:
+                # Say so out loud. A silent miss here is indistinguishable from
+                # a successful load, and it is the difference between "you are
+                # still logged in" and "log in again": name the path that was
+                # checked so a wrong one is visible at a glance.
+                logger.info(f"No persisted sessions at {SESSIONS_FILE} - starting empty")
         except Exception as e:
             logger.warning(f"Could not load sessions from file: {e}")
             self._tokens = {}
