@@ -75,6 +75,32 @@ def _pre_trigger_arm_mode_attr(coordinator: GuardianCoordinator, device_id: int)
     return None
 
 
+_ESTADO_TEXTO = {
+    "disarmed": "Desarmado",
+    "armed_away": "Armado",
+    "armed_home": "Armado parcial",
+    "armed_night": "Armado noturno",
+    "armed_vacation": "Armado viagem",
+    "arming": "Armando",
+    "pending": "Entrando",
+    "triggered": "DISPARADO",
+}
+
+
+def _estado_texto(state) -> str:
+    """Name the panel's state in the language the rest of this integration speaks.
+
+    The card in front of the user reads "Armado ausente", because that is how
+    Home Assistant names `armed_away` for every alarm brand there is - correct
+    and unhelpful on a panel whose owner only ever arms it whole. Core state
+    names have no per-entity override, so carry the wording as an attribute the
+    tile card can show through `state_content`.
+    """
+    if state is None:
+        return "Desconhecido"
+    return _ESTADO_TEXTO.get(str(state), str(state))
+
+
 def _last_trigger_attrs(
     coordinator: GuardianCoordinator, device_id: int
 ) -> Dict[str, Any]:
@@ -396,6 +422,7 @@ class GuardianAlarmControlPanel(CoordinatorEntity, AlarmControlPanelEntity):
             attrs["connection_unavailable_raw"] = device.get("connection_unavailable_raw", False)
             attrs["last_updated"] = device.get("last_updated")
 
+        attrs["estado_texto"] = _estado_texto(self.state)
         attrs["pre_trigger_arm_mode"] = _pre_trigger_arm_mode_attr(self.coordinator, self._device_id)
         attrs.update(_last_trigger_attrs(self.coordinator, self._device_id))
         return attrs
@@ -940,6 +967,7 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
             # unified entity does not drop to mode-based heuristics
             # after a restart while the central is partially armed.
             "last_arm_intent": self._last_arm_intent,
+            "estado_texto": _estado_texto(self.state),
         }
 
         if device:
