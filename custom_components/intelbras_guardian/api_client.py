@@ -471,8 +471,17 @@ class GuardianApiClient:
         except Exception:
             return False
 
-    async def check_session(self) -> bool:
-        """Check if current session is still valid."""
+    async def check_session(self) -> Optional[bool]:
+        """Say whether the stored session is good, bad, or simply unknown.
+
+        Three answers, not two: True when the middleware accepts the session,
+        False when it rejects it, and None when the middleware could not be
+        asked at all. Folding that last case into False threw the credential
+        away whenever the answer was merely unavailable - and on a host reboot
+        that is the normal case, because Home Assistant Core is already serving
+        while the add-on is still starting, so the first check of every boot
+        runs against a closed port.
+        """
         if not self._session_id:
             return False
         try:
@@ -481,9 +490,20 @@ class GuardianApiClient:
                     f"{self._base_url}/api/v1/auth/session",
                     headers={"X-Session-ID": self._session_id}
                 )
-                return response.status == 200
-        except Exception:
-            return False
+                if response.status == 200:
+                    return True
+                if response.status in (401, 403):
+                    return False
+                # Anything else is the middleware in trouble, not a verdict on
+                # the session.
+                _LOGGER.warning(
+                    "Session check answered %s - treating the session as unknown",
+                    response.status,
+                )
+                return None
+        except Exception as err:
+            _LOGGER.warning("Could not reach the middleware to check the session: %s", err)
+            return None
 
     def set_session_id(self, session_id: str) -> None:
         """Set the session ID (for restoring from config)."""

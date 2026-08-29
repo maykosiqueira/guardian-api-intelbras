@@ -6,7 +6,7 @@ import time
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, Event
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
 from .api_client import GuardianApiClient
 from .const import CONF_FASTAPI_HOST, CONF_FASTAPI_PORT, CONF_SESSION_ID, DOMAIN, PLATFORMS
@@ -214,8 +214,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     stored_session_id = entry.data.get(CONF_SESSION_ID)
     if stored_session_id:
         client.set_session_id(stored_session_id)
-        if await client.check_session():
+        session_state = await client.check_session()
+        if session_state:
             _LOGGER.info("Restored existing session")
+        elif session_state is None:
+            # Unreachable is not a rejection. Let Home Assistant retry setup
+            # with backoff instead of discarding a session that is almost
+            # certainly still valid - on a host reboot the add-on is still
+            # starting when Core first asks, and answering "invalid" there
+            # cost the user a manual login on every boot.
+            raise ConfigEntryNotReady(
+                "Middleware did not answer the session check yet"
+            )
         else:
             _LOGGER.warning("Stored session expired or invalid")
             # Session is invalid - user needs to re-authenticate via OAuth
