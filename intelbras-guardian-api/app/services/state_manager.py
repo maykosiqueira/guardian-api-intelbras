@@ -1,6 +1,7 @@
 """State management for tokens and device cache."""
 import logging
 import json
+import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 from pathlib import Path
@@ -11,8 +12,18 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# File path for persisting sessions
-SESSIONS_FILE = Path(__file__).parent.parent.parent / "data" / "sessions.json"
+# File path for persisting sessions.
+#
+# Where this file lands decides whether a restart keeps the user logged in.
+# The add-on gets exactly one persistent mount, /data, and announces it in
+# DATA_PATH; the compose install instead mounts its volume on ./data beside
+# the app. Writing to the source-relative path unconditionally put the
+# add-on's tokens, saved panel passwords and last known status inside the
+# container layer, which Supervisor discards - every restart asked for the
+# Intelbras login and the panel password again.
+_LEGACY_SESSIONS_FILE = Path(__file__).parent.parent.parent / "data" / "sessions.json"
+_DATA_DIR = Path(os.environ["DATA_PATH"]) if os.environ.get("DATA_PATH") else _LEGACY_SESSIONS_FILE.parent
+SESSIONS_FILE = _DATA_DIR / "sessions.json"
 
 
 class InMemoryStateManager:
@@ -61,8 +72,14 @@ class InMemoryStateManager:
     def _load_sessions(self) -> None:
         """Load sessions from file on startup."""
         try:
-            if SESSIONS_FILE.exists():
-                with open(SESSIONS_FILE, "r") as f:
+            # An install that ran before DATA_PATH was honoured still has its
+            # state at the source-relative path: read it once so the upgrade
+            # does not log the user out.
+            source = SESSIONS_FILE if SESSIONS_FILE.exists() else _LEGACY_SESSIONS_FILE
+            if source.exists():
+                if source != SESSIONS_FILE:
+                    logger.info(f"Migrating persisted sessions from {source} to {SESSIONS_FILE}")
+                with open(source, "r") as f:
                     data = json.load(f)
                     self._tokens = data.get("tokens", {})
                     self._device_passwords = self._migrate_device_passwords(
