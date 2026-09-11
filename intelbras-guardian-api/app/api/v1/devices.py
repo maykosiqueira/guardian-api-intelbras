@@ -232,9 +232,27 @@ async def get_device_raw(
             detail = await guardian_client.get_central_detail(access_token, device_id)
         except Exception as e:  # noqa: BLE001 - diagnostics: report, do not fail
             detail = {"error": str(e)}
-        return {"device_id": device_id, "listed": listed, "detail": detail}
+        return {"device_id": device_id, "listed": _redigido(listed), "detail": _redigido(detail)}
     except InvalidSessionError as e:
         raise HTTPException(status_code=401, detail=str(e.message))
+
+
+# The cloud's central object carries the panel password and the remote
+# password in clear text. They never leave this process through the
+# diagnostics route: whoever needs them has them already, and a log or a
+# pasted response must not be the place they turn up.
+_CHAVES_SIGILOSAS = ("password", "remote_password", "token", "secret")
+
+
+def _redigido(obj):
+    if isinstance(obj, dict):
+        return {
+            k: ("<redigido>" if any(s in k.lower() for s in _CHAVES_SIGILOSAS) else _redigido(v))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_redigido(x) for x in obj]
+    return obj
 
 
 @router.get("/{device_id}/partitions/status")
