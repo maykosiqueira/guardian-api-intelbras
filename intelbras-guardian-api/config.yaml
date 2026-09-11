@@ -1,6 +1,6 @@
 name: "Intelbras Guardian API"
 description: "API middleware for Intelbras Guardian alarm systems integration with Home Assistant"
-version: "1.0.5"
+version: "1.0.6"
 slug: "intelbras-guardian-api"
 url: "https://github.com/bobaoapae/guardian-api-intelbras"
 arch:

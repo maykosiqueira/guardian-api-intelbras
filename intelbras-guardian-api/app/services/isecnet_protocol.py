@@ -646,7 +646,7 @@ class ISECNetProtocol:
     def _build_isecv1_model_status_cmd(self, password: str, model_code: Optional[int] = None) -> bytes:
         """Build ISECNet V1 status command appropriate for the panel model."""
         cmd_byte = self._get_status_cmd_for_model(model_code)
-        logger.info(f"Using status command 0x{cmd_byte:02X} for model_code={model_code}")
+        logger.debug(f"Using status command 0x{cmd_byte:02X} for model_code={model_code}")
         return self._build_isecv1_cmd([cmd_byte], password)
 
     def _build_isecv1_arm_cmd(self, password: str, partition_index: Optional[int] = None, stay: bool = False, include_partition: bool = True) -> bytes:
@@ -828,7 +828,7 @@ class ISECNetProtocol:
         # Check if this is an eletrificador (electric fence)
         if self._is_eletrificador_model(model_code):
             status.is_eletrificador = True
-            logger.info(f"Detected eletrificador model: {status.model}")
+            logger.debug(f"Detected eletrificador model: {status.model}")
 
             # For eletrificador, byte layout is different:
             # data[21] = shock status byte (eletricfierState)
@@ -842,12 +842,12 @@ class ISECNetProtocol:
 
             # Parse shock (fence) state
             status.shock_enabled, status.shock_triggered = self._parse_eletrificador_state(shock_byte)
-            logger.info(f"Eletrificador SHOCK: enabled={status.shock_enabled}, triggered={status.shock_triggered}")
+            logger.debug(f"Eletrificador SHOCK: enabled={status.shock_enabled}, triggered={status.shock_triggered}")
 
             # Parse alarm state
             alarm_state, status.alarm_triggered = self._parse_eletrificador_alarm_state(alarm_byte, panic_byte)
             status.alarm_enabled = alarm_state != "disarmed"
-            logger.info(f"Eletrificador ALARM: enabled={status.alarm_enabled}, state={alarm_state}, triggered={status.alarm_triggered}")
+            logger.debug(f"Eletrificador ALARM: enabled={status.alarm_enabled}, state={alarm_state}, triggered={status.alarm_triggered}")
 
             # Set overall status based on both shock and alarm
             # If either is triggered, overall is triggered
@@ -861,7 +861,7 @@ class ISECNetProtocol:
                 status.is_armed = False
                 status.arm_mode = "disarmed"
 
-            logger.info(f"Eletrificador status: shock_enabled={status.shock_enabled}, alarm_enabled={status.alarm_enabled}, "
+            logger.debug(f"Eletrificador status: shock_enabled={status.shock_enabled}, alarm_enabled={status.alarm_enabled}, "
                        f"shock_triggered={status.shock_triggered}, alarm_triggered={status.alarm_triggered}")
 
             return status
@@ -886,14 +886,14 @@ class ISECNetProtocol:
         partition_enabled = data[partition_offset]
         status.partitions_enabled = bool(partition_enabled)
         self._partitions_enabled = bool(partition_enabled)  # Cache for arm/disarm commands
-        logger.info(f"Partition enabled byte (data[{partition_offset}]): {partition_enabled} (partitions_enabled={status.partitions_enabled})")
+        logger.debug(f"Partition enabled byte (data[{partition_offset}]): {partition_enabled} (partitions_enabled={status.partitions_enabled})")
 
         # Partition armed status bits
         # APK parsePartitions: Each bit represents one partition's armed state
         # bit 7 = partition A armed, bit 6 = partition B armed, etc. (charAt mapping)
         # For AMT 4010 with 4 partitions: A,B in data[28], C,D in data[29]
         partition_status_byte = data[armed_offset]
-        logger.info(f"Partition status byte (data[{armed_offset}]): 0x{partition_status_byte:02X} (binary: {bin(partition_status_byte)})")
+        logger.debug(f"Partition status byte (data[{armed_offset}]): 0x{partition_status_byte:02X} (binary: {bin(partition_status_byte)})")
 
         # Parse partitions - one bit per partition
         # AMT 2018 family: all partitions in single byte (data[22])
@@ -986,7 +986,7 @@ class ISECNetProtocol:
 
         # Parse zone/sector status
         # Log full hex data for debugging zone byte positions
-        logger.info(f"V1 status raw data ({len(data)} bytes): {bytes(data).hex()}")
+        logger.debug(f"V1 status raw data ({len(data)} bytes): {bytes(data).hex()}")
 
         # Zone open status bytes - model-specific byte counts
         # From APK: AMT 2018 family uses 6 bytes (48 zones), AMT 4010 uses 8 (64 zones),
@@ -1005,7 +1005,7 @@ class ISECNetProtocol:
 
         if len(data) > zone_bytes_start + zone_bytes_count:
             zone_hex = bytes(data[zone_bytes_start:zone_bytes_start + zone_bytes_count]).hex()
-            logger.info(f"Zone bytes (data[{zone_bytes_start}:{zone_bytes_start + zone_bytes_count}]): {zone_hex}")
+            logger.debug(f"Zone bytes (data[{zone_bytes_start}:{zone_bytes_start + zone_bytes_count}]): {zone_hex}")
 
             open_zones = []
             for byte_idx in range(zone_bytes_count):
@@ -1023,9 +1023,9 @@ class ISECNetProtocol:
                         open_zones.append(zone_num)
 
             if open_zones:
-                logger.info(f"Open zones: {open_zones}")
+                logger.debug(f"Open zones: {open_zones}")
             else:
-                logger.info("All zones closed")
+                logger.debug("All zones closed")
 
         # Zone alarm bytes - which zones have triggered alarms
         # From APK: alarm bytes follow open bytes with same count
@@ -1119,7 +1119,7 @@ class ISECNetProtocol:
                     zone_signal[zone_idx] = data[signal_offset]
             status.zone_signal = zone_signal
 
-            logger.info(f"Extended status: wireless_zones={wireless_zones}, "
+            logger.debug(f"Extended status: wireless_zones={wireless_zones}, "
                         f"battery_low={battery_low}, tamper={tamper_zones}")
 
             # Enrich zone entries with wireless data
@@ -1515,7 +1515,7 @@ class ISECNetProtocol:
         # Check if this is an eletrificador (electric fence)
         if self._is_eletrificador_model(model_code):
             status.is_eletrificador = True
-            logger.info(f"V2: Detected eletrificador model: {status.model}")
+            logger.debug(f"V2: Detected eletrificador model: {status.model}")
 
             # For eletrificador via Cloud (V2), byte layout:
             # response[30] = shock status byte (eletricfierState)
@@ -1530,12 +1530,12 @@ class ISECNetProtocol:
 
                 # Parse shock (fence) state
                 status.shock_enabled, status.shock_triggered = self._parse_eletrificador_state(shock_byte)
-                logger.info(f"V2 Eletrificador SHOCK: enabled={status.shock_enabled}, triggered={status.shock_triggered}")
+                logger.debug(f"V2 Eletrificador SHOCK: enabled={status.shock_enabled}, triggered={status.shock_triggered}")
 
                 # Parse alarm state
                 alarm_state, status.alarm_triggered = self._parse_eletrificador_alarm_state(alarm_byte, panic_byte)
                 status.alarm_enabled = alarm_state != "disarmed"
-                logger.info(f"V2 Eletrificador ALARM: enabled={status.alarm_enabled}, state={alarm_state}, triggered={status.alarm_triggered}")
+                logger.debug(f"V2 Eletrificador ALARM: enabled={status.alarm_enabled}, state={alarm_state}, triggered={status.alarm_triggered}")
 
                 # Set overall status based on alarm state
                 status.arm_mode = alarm_state
@@ -1875,7 +1875,7 @@ class ISECNetProtocol:
 
                     hex_str = response.hex()
                     cmd_used = self._get_status_cmd_for_model(self._model_code)
-                    logger.info(f"Model status raw (cmd=0x{cmd_used:02X}, model={self._model_code}, {len(response)} bytes): {hex_str}")
+                    logger.debug(f"Model status raw (cmd=0x{cmd_used:02X}, model={self._model_code}, {len(response)} bytes): {hex_str}")
                     return True, hex_str
                 else:
                     # V2 uses the same status command
@@ -1886,7 +1886,7 @@ class ISECNetProtocol:
                         return False, "No response"
 
                     hex_str = response.hex()
-                    logger.info(f"V2 Complete status raw ({len(response)} bytes): {hex_str}")
+                    logger.debug(f"V2 Complete status raw ({len(response)} bytes): {hex_str}")
                     return True, hex_str
 
             except Exception as e:

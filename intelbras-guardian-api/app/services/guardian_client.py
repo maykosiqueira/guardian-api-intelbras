@@ -193,7 +193,7 @@ class GuardianClient:
         Returns:
             Partition status dictionary
         """
-        logger.info(f"Fetching partition status: central={central_id} partition={partition_id}")
+        logger.debug(f"Fetching partition status: central={central_id} partition={partition_id}")
         response = await self._request(
             method="GET",
             endpoint=f"/api/v2/alarm-centrals/{central_id}/partitions/{partition_id}",
@@ -216,7 +216,7 @@ class GuardianClient:
         Returns:
             Central status dictionary with partitions
         """
-        logger.info(f"Fetching central status: central={central_id}")
+        logger.debug(f"Fetching central status: central={central_id}")
         response = await self._request(
             method="GET",
             endpoint=f"/api/v2/alarm-centrals/{central_id}/status",
@@ -239,7 +239,7 @@ class GuardianClient:
         Returns:
             Central detail dictionary
         """
-        logger.info(f"Fetching central detail: central={central_id}")
+        logger.debug(f"Fetching central detail: central={central_id}")
         response = await self._request(
             method="GET",
             endpoint=f"/api/v2/alarm-centrals/{central_id}",
@@ -328,7 +328,7 @@ class GuardianClient:
         Returns:
             List of event dictionaries
         """
-        logger.info(f"Fetching events: offset={offset} limit={limit}")
+        logger.debug(f"Fetching events: offset={offset} limit={limit}")
         response = await self._request(
             method="GET",
             endpoint="/api/v2/events",
@@ -358,7 +358,7 @@ class GuardianClient:
         Returns:
             List of zone dictionaries
         """
-        logger.info(f"Fetching zones for central: {central_id}")
+        logger.debug(f"Fetching zones for central: {central_id}")
         response = await self._request(
             method="GET",
             endpoint=f"/api/v2/alarm-centrals/{central_id}/zones",
