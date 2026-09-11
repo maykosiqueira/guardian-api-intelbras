@@ -31,6 +31,17 @@ class Settings(BaseSettings):
     HOST: str = Field(default="0.0.0.0", description="Server host")
     PORT: int = Field(default=8000, description="Server port")
     DEBUG: bool = Field(default=False, description="Debug mode")
+
+    # Arm and disarm go through the Guardian cloud API — the path the official
+    # app takes, where the cloud itself sends the command to the panel. The
+    # ISECNet relay path builds the frame here and an ANM 24 Net G2 was measured
+    # (2026-09-11) refusing it with 0xE4 "open zones" while arming normally from
+    # the app with every door shut. The relay stays as a fallback for when the
+    # cloud call itself fails (endpoint missing, transport error, 5xx).
+    COMMANDS_VIA_CLOUD_API: bool = Field(
+        default=True,
+        description="Arm/disarm through the cloud API (app path) instead of the ISECNet relay",
+    )
     LOG_LEVEL: str = Field(default="INFO", description="Logging level")
 
     @field_validator("LOG_LEVEL", mode="before")

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 from enum import Enum
 
+from app.core.config import settings
 from app.services.auth_service import auth_service
 from app.services.guardian_client import guardian_client
 from app.services.isecnet_client import isecnet_client
@@ -401,6 +402,135 @@ async def _get_partition_index(access_token: str, device_id: int, partition_id: 
     return None
 
 
+async def _arm_accepted(device_id: int, request: "ArmRequest") -> "AlarmOperationResponse":
+    """What every successful arm does, whichever path carried the command."""
+    # Clear device cache to force refresh
+    await state_manager.delete_device_state(device_id)
+    new_status = "armed_away" if request.mode == ArmMode.AWAY else "armed_stay"
+    # Broadcast SSE event for instant HA state update
+    await event_stream.broadcast_event({
+        "event_type": "state_changed",
+        "device_id": device_id,
+        "partition_id": request.partition_id,
+        "new_status": new_status,
+        "source": "command",
+    }, event_type="alarm_event")
+    return AlarmOperationResponse(
+        success=True,
+        device_id=device_id,
+        partition_id=request.partition_id,
+        new_status=new_status,
+        message=f"Armed in {request.mode.value} mode",
+    )
+
+
+async def _disarm_accepted(device_id: int, request: "DisarmRequest") -> "AlarmOperationResponse":
+    """What every successful disarm does, whichever path carried the command."""
+    await state_manager.delete_device_state(device_id)
+    await event_stream.broadcast_event({
+        "event_type": "state_changed",
+        "device_id": device_id,
+        "partition_id": request.partition_id,
+        "new_status": "disarmed",
+        "source": "command",
+    }, event_type="alarm_event")
+    return AlarmOperationResponse(
+        success=True,
+        device_id=device_id,
+        partition_id=request.partition_id,
+        new_status="disarmed",
+        message="Disarmed successfully",
+    )
+
+
+async def _cloud_partition_ids(
+    access_token: str, device_id: int, partition_id: Optional[int]
+) -> List[int]:
+    """Partition API ids a command targets: the one given, or every partition of the device."""
+    if partition_id is not None:
+        return [partition_id]
+    raw_devices = await guardian_client.get_alarm_centrals(access_token)
+    for device in raw_devices:
+        if device.get("id") == device_id:
+            return [
+                p["id"]
+                for p in (device.get("partitions") or [])
+                if isinstance(p, dict) and p.get("id") is not None
+            ]
+    return []
+
+
+async def _command_via_cloud_api(
+    access_token: str,
+    device_id: int,
+    partition_id: Optional[int],
+    action: str,
+    mode: str = "away",
+) -> tuple:
+    """Arm or disarm through the Guardian cloud API — the path the official app takes.
+
+    Returns (accepted, message, refusal):
+    - accepted True: every target partition took the command.
+    - accepted False, refusal set: the cloud answered a client error, which is
+      the panel or the cloud refusing the command itself (open zones, wrong
+      state). Falling back to the relay would just ask the same panel again.
+    - accepted False, refusal None: the request did not get through (unknown
+      endpoint, transport error, 5xx) and the caller may fall back.
+    """
+    partition_ids = await _cloud_partition_ids(access_token, device_id, partition_id)
+    if not partition_ids:
+        return False, "Device has no partitions registered in the cloud", None
+
+    for pid in partition_ids:
+        try:
+            if action == "arm":
+                result = await guardian_client.arm_partition(access_token, device_id, pid, mode)
+            else:
+                result = await guardian_client.disarm_partition(access_token, device_id, pid)
+            logger.info(
+                f"Cloud API {action} accepted for device {device_id} partition {pid}: "
+                f"{str(result.get('response'))[:200]}"
+            )
+        except AlarmOperationError as e:
+            details = e.details or {}
+            status = details.get("status")
+            body = details.get("body", "")
+            if isinstance(status, int) and 400 <= status < 500:
+                logger.warning(
+                    f"Cloud API refused {action} for device {device_id} partition {pid}: HTTP {status} {body}"
+                )
+                return False, (f"HTTP {status}: {body}" if body else f"HTTP {status}"), {"status": status, "body": body}
+            logger.warning(
+                f"Cloud API {action} request failed for device {device_id} partition {pid}: {e.message} {details}"
+            )
+            return False, str(e.message), None
+        except Exception as e:  # noqa: BLE001 - 404 (DeviceNotFoundError), auth, transport
+            logger.warning(f"Cloud API {action} unavailable for device {device_id} partition {pid}: {e}")
+            return False, str(e), None
+    return True, "OK", None
+
+
+def _raise_cloud_refusal(action: str, message: str, refusal: dict) -> None:
+    """Turn a cloud-side refusal into the error shape the integration already understands."""
+    body = (refusal.get("body") or "").lower()
+    if "zona" in body or "zone" in body or "abert" in body or "open" in body:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "OpenZonesError",
+                "message": "Não é possível armar: existem zonas abertas",
+                "open_zones": [],
+            },
+        )
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "error": "CommandRefused",
+            "message": f"A nuvem recusou o comando de {action}: {message}",
+        },
+    )
+
+
 @router.post("/{device_id}/arm", response_model=AlarmOperationResponse)
 async def arm_partition(
     device_id: int,
@@ -408,7 +538,8 @@ async def arm_partition(
     x_session_id: str = Header(..., alias="X-Session-ID")
 ):
     """
-    Arm a partition using ISECNet protocol.
+    Arm a partition — through the cloud API (the app's path) when
+    COMMANDS_VIA_CLOUD_API is on, with the ISECNet relay as fallback.
 
     WARNING: This will actually arm your alarm system!
 
@@ -448,6 +579,17 @@ async def arm_partition(
         # Get cached partitions_enabled to know whether to include partition byte
         # This is set by auto-sync when getting status
         cached_partitions_enabled = await state_manager.get_device_partitions_enabled(device_id)
+        if settings.COMMANDS_VIA_CLOUD_API:
+            logger.info(f"Arming device {device_id} via cloud API partition_id={request.partition_id} mode={request.mode}")
+            accepted, cloud_message, refusal = await _command_via_cloud_api(
+                access_token, device_id, request.partition_id, "arm", request.mode.value
+            )
+            if accepted:
+                return await _arm_accepted(device_id, request)
+            if refusal is not None:
+                _raise_cloud_refusal("arme", cloud_message, refusal)
+            logger.warning(f"Cloud API arm unavailable ({cloud_message}); falling back to the ISECNet relay")
+
         logger.info(f"Arming device {device_id} (MAC: {conn_info.mac}) via {conn_type} partition_index={partition_index} mode={request.mode} partitions_enabled={cached_partitions_enabled}")
 
         # Arm using ISECNet protocol
@@ -575,28 +717,7 @@ async def arm_partition(
                 )
             raise AlarmOperationError(f"Failed to arm: {message}")
 
-        # Clear device cache to force refresh
-        await state_manager.delete_device_state(device_id)
-
-        # Determine new status based on mode
-        new_status = "armed_away" if request.mode == ArmMode.AWAY else "armed_stay"
-
-        # Broadcast SSE event for instant HA state update
-        await event_stream.broadcast_event({
-            "event_type": "state_changed",
-            "device_id": device_id,
-            "partition_id": request.partition_id,
-            "new_status": new_status,
-            "source": "command",
-        }, event_type="alarm_event")
-
-        return AlarmOperationResponse(
-            success=True,
-            device_id=device_id,
-            partition_id=request.partition_id,
-            new_status=new_status,
-            message=f"Armed in {request.mode.value} mode"
-        )
+        return await _arm_accepted(device_id, request)
 
     except HTTPException:
         # Re-raise HTTPExceptions (including OpenZonesError) as-is
@@ -837,7 +958,8 @@ async def disarm_partition(
     x_session_id: str = Header(..., alias="X-Session-ID")
 ):
     """
-    Disarm a partition using ISECNet protocol.
+    Disarm a partition — through the cloud API (the app's path) when
+    COMMANDS_VIA_CLOUD_API is on, with the ISECNet relay as fallback.
 
     WARNING: This will actually disarm your alarm system!
 
@@ -877,6 +999,17 @@ async def disarm_partition(
         # Get cached partitions_enabled to know whether to include partition byte
         # This is set by auto-sync when getting status
         cached_partitions_enabled = await state_manager.get_device_partitions_enabled(device_id)
+        if settings.COMMANDS_VIA_CLOUD_API:
+            logger.info(f"Disarming device {device_id} via cloud API partition_id={request.partition_id}")
+            accepted, cloud_message, refusal = await _command_via_cloud_api(
+                access_token, device_id, request.partition_id, "disarm"
+            )
+            if accepted:
+                return await _disarm_accepted(device_id, request)
+            if refusal is not None:
+                _raise_cloud_refusal("desarme", cloud_message, refusal)
+            logger.warning(f"Cloud API disarm unavailable ({cloud_message}); falling back to the ISECNet relay")
+
         logger.info(f"Disarming device {device_id} (MAC: {conn_info.mac}) via {conn_type} partition_index={partition_index} partitions_enabled={cached_partitions_enabled}")
 
         # Disarm using ISECNet protocol
@@ -909,25 +1042,7 @@ async def disarm_partition(
 
             raise AlarmOperationError(f"Failed to disarm: {message}")
 
-        # Clear device cache to force refresh
-        await state_manager.delete_device_state(device_id)
-
-        # Broadcast SSE event for instant HA state update
-        await event_stream.broadcast_event({
-            "event_type": "state_changed",
-            "device_id": device_id,
-            "partition_id": request.partition_id,
-            "new_status": "disarmed",
-            "source": "command",
-        }, event_type="alarm_event")
-
-        return AlarmOperationResponse(
-            success=True,
-            device_id=device_id,
-            partition_id=request.partition_id,
-            new_status="disarmed",
-            message="Disarmed successfully"
-        )
+        return await _disarm_accepted(device_id, request)
 
     except HTTPException:
         # Re-raise HTTPExceptions as-is
