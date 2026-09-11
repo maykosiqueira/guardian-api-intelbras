@@ -137,7 +137,7 @@ class GuardianClient:
                 if response.status >= 400:
                     raise APIConnectionError(
                         f"API error: {response.status}",
-                        {"status": response.status, "body": response_text[:200]}
+                        {"status": response.status, "body": response_text[:600]}
                     )
 
                 # Try to parse JSON, return empty dict if empty response
@@ -426,6 +426,34 @@ class GuardianClient:
             return {"success": True, "response": response}
         except APIConnectionError as e:
             raise AlarmOperationError(f"Failed to deactivate eletrificador: {e.message}", e.details)
+
+
+    async def central_operation(
+        self,
+        access_token: str,
+        central_id: int,
+        activate: bool,
+        operation: str,
+    ) -> Dict[str, Any]:
+        """Send an operation to the central itself: POST .../activate or .../deactivate.
+
+        The same two endpoints the eletrificador uses, with the `operation`
+        value naming what is being switched. For a panel the cloud lists
+        without partitions there is no per-partition endpoint to call, and
+        this is the level the official app's "Ativação do Usuário" lands on.
+        """
+        suffix = "activate" if activate else "deactivate"
+        logger.info(f"Central {suffix}: central={central_id} operation={operation}")
+        try:
+            response = await self._request(
+                method="POST",
+                endpoint=f"/api/v2/alarm-centrals/{central_id}/{suffix}",
+                access_token=access_token,
+                data={"operation": operation}
+            )
+            return {"success": True, "response": response}
+        except APIConnectionError as e:
+            raise AlarmOperationError(f"Failed to {suffix} central: {e.message}", e.details)
 
 
 # Global client instance

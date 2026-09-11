@@ -443,6 +443,10 @@ async def _disarm_accepted(device_id: int, request: "DisarmRequest") -> "AlarmOp
     )
 
 
+# Operation names for the central-level cloud endpoints, by action.
+CLOUD_CENTRAL_OPERATIONS = {"arm": "ACTIVATE_CENTRAL", "disarm": "DEACTIVATE_CENTRAL"}
+
+
 async def _cloud_partition_ids(
     access_token: str, device_id: int, partition_id: Optional[int]
 ) -> List[int]:
@@ -479,7 +483,34 @@ async def _command_via_cloud_api(
     """
     partition_ids = await _cloud_partition_ids(access_token, device_id, partition_id)
     if not partition_ids:
-        return False, "Device has no partitions registered in the cloud", None
+        # The cloud lists this panel without partitions (the ANM 24 Net G2 is
+        # one), so the command goes to the central itself. The operation names
+        # follow the cloud's own vocabulary — its state values are ACTIVATED /
+        # DEACTIVATED and the fence uses ACTIVATE_ELETRICFIER.
+        operation = CLOUD_CENTRAL_OPERATIONS[action]
+        try:
+            result = await guardian_client.central_operation(
+                access_token, device_id, activate=(action == "arm"), operation=operation
+            )
+            logger.info(
+                f"Cloud API {action} accepted for central {device_id} ({operation}): "
+                f"{str(result.get('response'))[:300]}"
+            )
+            return True, "OK", None
+        except AlarmOperationError as e:
+            details = e.details or {}
+            status = details.get("status")
+            body = details.get("body", "")
+            if isinstance(status, int) and 400 <= status < 500:
+                logger.warning(
+                    f"Cloud API refused {action} for central {device_id} ({operation}): HTTP {status} {body}"
+                )
+                return False, (f"HTTP {status}: {body}" if body else f"HTTP {status}"), {"status": status, "body": body}
+            logger.warning(f"Cloud API {action} request failed for central {device_id}: {e.message} {details}")
+            return False, str(e.message), None
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Cloud API {action} unavailable for central {device_id}: {e}")
+            return False, str(e), None
 
     for pid in partition_ids:
         try:
