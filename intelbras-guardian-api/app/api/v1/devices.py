@@ -208,6 +208,35 @@ async def get_device(
         raise HTTPException(status_code=503, detail=str(e.message))
 
 
+@router.get("/{device_id}/raw")
+async def get_device_raw(
+    device_id: int,
+    x_session_id: str = Header(..., alias="X-Session-ID")
+):
+    """The cloud's own objects for a central, untouched by the parser.
+
+    Diagnostics only. The parsed /devices view drops whatever it does not
+    model, and when the cloud describes a panel in a way the parser did not
+    anticipate — an alarm central listed without partitions, say — this is
+    the only place that shows what the cloud actually said. Read-only: two
+    GETs against the cloud, nothing sent to the panel.
+    """
+    try:
+        access_token = await auth_service.get_valid_token(x_session_id)
+        listed = None
+        for raw in await guardian_client.get_alarm_centrals(access_token):
+            if raw.get("id") == device_id:
+                listed = raw
+                break
+        try:
+            detail = await guardian_client.get_central_detail(access_token, device_id)
+        except Exception as e:  # noqa: BLE001 - diagnostics: report, do not fail
+            detail = {"error": str(e)}
+        return {"device_id": device_id, "listed": listed, "detail": detail}
+    except InvalidSessionError as e:
+        raise HTTPException(status_code=401, detail=str(e.message))
+
+
 @router.get("/{device_id}/partitions/status")
 async def get_partitions_status(
     device_id: int,
