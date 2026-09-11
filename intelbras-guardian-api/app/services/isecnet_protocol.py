@@ -927,7 +927,7 @@ class ISECNetProtocol:
                 "state": state,
                 "armed": is_armed
             })
-            logger.info(f"Partition {i}: armed={is_armed}, state={state}")
+            logger.debug(f"Partition {i}: armed={is_armed}, state={state}")
 
         status.partitions = partitions
 
@@ -1130,7 +1130,7 @@ class ISECNetProtocol:
                 zone["signal"] = zone_signal.get(idx)
                 zone["tamper"] = idx in tamper_zones
 
-        logger.info(f"Parsed status: model={status.model}, armed={status.is_armed}, "
+        logger.debug(f"Parsed status: model={status.model}, armed={status.is_armed}, "
                    f"mode={status.arm_mode}, triggered={status.is_triggered}")
 
         return status

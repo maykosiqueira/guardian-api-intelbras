@@ -10,7 +10,15 @@ CONF_DEVICE_PASSWORD = "device_password"
 
 # Default values
 DEFAULT_FASTAPI_PORT = 8000
-DEFAULT_SCAN_INTERVAL = 1
+# Seconds between status polls against the middleware.
+#
+# 5 s, not 1 s: for a panel the middleware reaches via the cloud, every poll
+# is a cloud request, so 1 Hz means 86,400 cloud calls a day for a state that
+# changes a handful of times. Nothing here depends on a faster cadence — arm
+# and disarm update the entity optimistically the moment the command is sent,
+# alarm events arrive in real time over SSE, and the connection-unavailable
+# debounce is measured in seconds, not in polls.
+DEFAULT_SCAN_INTERVAL = 5
 
 # Eletrificador models
 ELETRIFICADOR_MODELS = ["ELC", "ELETRIFICADOR"]

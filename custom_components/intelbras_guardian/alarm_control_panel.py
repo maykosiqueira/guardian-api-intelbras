@@ -420,7 +420,13 @@ class GuardianAlarmControlPanel(CoordinatorEntity, AlarmControlPanelEntity):
             # actually flipping to unavailable.
             attrs["connection_unavailable"] = device.get("connection_unavailable", False)
             attrs["connection_unavailable_raw"] = device.get("connection_unavailable_raw", False)
-            attrs["last_updated"] = device.get("last_updated")
+            # The middleware's `last_updated` stamp is deliberately NOT an
+            # attribute. Home Assistant records a new state row whenever any
+            # attribute differs, and a stamp that moves on every poll turns a
+            # panel that never changes into one row per poll: measured at
+            # 891,560 rows for this single entity against 2,898 for the next
+            # busiest one, and an 849 MB database. The entity already carries
+            # HA's own `last_updated`/`last_changed`, which say the same thing.
 
         attrs["estado_texto"] = _estado_texto(self.state)
         attrs["pre_trigger_arm_mode"] = _pre_trigger_arm_mode_attr(self.coordinator, self._device_id)
@@ -973,7 +979,8 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
         if device:
             attrs["connection_unavailable"] = device.get("connection_unavailable", False)
             attrs["connection_unavailable_raw"] = device.get("connection_unavailable_raw", False)
-            attrs["last_updated"] = device.get("last_updated")
+            # No `last_updated` attribute here either — see
+            # GuardianAlarmControlPanel.extra_state_attributes for why.
 
         attrs.update(_last_trigger_attrs(self.coordinator, self._device_id))
         return attrs

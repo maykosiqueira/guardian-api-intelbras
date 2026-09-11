@@ -1174,7 +1174,8 @@ async def get_alarm_status_auto(
             raise DeviceNotFoundError(f"Device {device_id} not found or connection info not available")
 
         conn_type = "IP Receiver" if conn_info.use_ip_receiver else "Cloud"
-        logger.info(f"Auto-sync status for device {device_id} (MAC: {conn_info.mac}) via {conn_type}")
+        # Per-request line: at INFO it is one entry per poll, all day long.
+        logger.debug(f"Auto-sync status for device {device_id} (MAC: {conn_info.mac}) via {conn_type}")
 
         # Get status using ISECNet protocol
         success, status, message = await isecnet_client.get_status(

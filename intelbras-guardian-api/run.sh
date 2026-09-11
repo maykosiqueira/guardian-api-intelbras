@@ -71,4 +71,7 @@ echo "API available at: http://[YOUR_HA_IP]:8000"
 echo "=============================================="
 
 # Run the FastAPI application
-exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+# No access log: every poll from Home Assistant would otherwise print a line
+# here, and the polls are the bulk of the traffic. Errors still surface
+# through the application logger.
+exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log

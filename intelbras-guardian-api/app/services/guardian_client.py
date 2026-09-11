@@ -162,7 +162,7 @@ class GuardianClient:
         Returns:
             List of alarm central dictionaries
         """
-        logger.info("Fetching alarm centrals")
+        logger.debug("Fetching alarm centrals")
         response = await self._request(
             method="GET",
             endpoint="/api/v2/alarm-centrals",
