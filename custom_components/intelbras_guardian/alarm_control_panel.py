@@ -90,11 +90,10 @@ _ESTADO_TEXTO = {
 def _estado_texto(state) -> str:
     """Name the panel's state in the language the rest of this integration speaks.
 
-    The card in front of the user reads "Armado ausente", because that is how
-    Home Assistant names `armed_away` for every alarm brand there is - correct
-    and unhelpful on a panel whose owner only ever arms it whole. Core state
-    names have no per-entity override, so carry the wording as an attribute the
-    tile card can show through `state_content`.
+    The state shown on the card comes from the entity's state translations
+    (translation_key "panel"); this attribute carries the same wording for
+    cards that render `state_content` from attributes, and for automations
+    that want the text rather than the raw state.
     """
     if state is None:
         return "Desconhecido"
@@ -211,6 +210,11 @@ class GuardianAlarmControlPanel(CoordinatorEntity, AlarmControlPanelEntity):
     """Representation of an Intelbras Guardian alarm partition."""
 
     _attr_has_entity_name = True
+    # State names come from translations/<lang>.json under
+    # entity.alarm_control_panel.panel.state: Home Assistant names armed_away
+    # "Armado ausente" for every alarm brand, and this panel's owner only
+    # ever arms it whole — the card should just say "Armado".
+    _attr_translation_key = "panel"
     _attr_code_arm_required = False
     _attr_code_format = None
     # Individual partitions only support ARM_AWAY (simple arm/disarm)
@@ -704,6 +708,11 @@ class GuardianUnifiedAlarmControlPanel(CoordinatorEntity, RestoreEntity, AlarmCo
     """Unified alarm control panel that controls multiple partitions."""
 
     _attr_has_entity_name = True
+    # State names come from translations/<lang>.json under
+    # entity.alarm_control_panel.panel.state: Home Assistant names armed_away
+    # "Armado ausente" for every alarm brand, and this panel's owner only
+    # ever arms it whole — the card should just say "Armado".
+    _attr_translation_key = "panel"
     _attr_code_arm_required = False
     _attr_code_format = None
     _attr_supported_features = (

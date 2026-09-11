@@ -109,5 +109,23 @@
       "no_devices": "No devices found.",
       "no_multi_partition_devices": "No devices with multiple partitions found."
     }
+  },
+  "entity": {
+    "alarm_control_panel": {
+      "panel": {
+        "state": {
+          "disarmed": "Disarmed",
+          "armed_away": "Armed",
+          "armed_home": "Armed (partial)",
+          "armed_night": "Armed (night)",
+          "armed_vacation": "Armed (vacation)",
+          "armed_custom_bypass": "Armed with bypass",
+          "arming": "Arming",
+          "disarming": "Disarming",
+          "pending": "Entry delay",
+          "triggered": "TRIGGERED"
+        }
+      }
+    }
   }
 }
