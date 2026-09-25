@@ -33,6 +33,18 @@ class DeviceConnection:
     max_reconnect_attempts: int = 3
 
 
+# Failure messages that describe availability, not protocol. The panel serves
+# one connection at a time: "busy" means someone else has it, and "not
+# connected" means the relay cannot reach it this instant. Both come and go on
+# their own.
+_MENSAGENS_DE_INDISPONIBILIDADE = ("busy", "not connected", "ocupada", "timeout")
+
+
+def _e_indisponibilidade(message: str) -> bool:
+    texto = (message or "").lower()
+    return any(m in texto for m in _MENSAGENS_DE_INDISPONIBILIDADE)
+
+
 class ISECNetClient:
     """
     ISECNet Client Service.
@@ -211,9 +223,22 @@ class ISECNetClient:
                         device_id=str(device_id),
                         force_v1=True
                     )
-                    if not success:
-                        # V1 failed — clear cache and retry with V2
-                        logger.info(f"Cached V1 failed for device {device_id}, clearing cache and trying V2")
+                    if not success and _e_indisponibilidade(message):
+                        # The panel answered — it is busy, or the relay says it
+                        # is not connected right now. Neither says anything
+                        # about which protocol it speaks, so the cached choice
+                        # stands. Dropping it here costs a wasted V2 attempt on
+                        # every later poll, and each attempt is one more session
+                        # against a panel that serves one at a time: the busier
+                        # the panel gets, the harder this makes it, which is the
+                        # opposite of what a retry should do.
+                        logger.debug(
+                            f"Cached V1 unavailable for device {device_id} ({message}); keeping the cached protocol"
+                        )
+                    elif not success:
+                        # A failure that is not about availability may well be
+                        # the protocol: drop the cache and try the other one.
+                        logger.info(f"Cached V1 failed for device {device_id} ({message}), clearing cache and trying V2")
                         del self._device_protocol[device_id]
                         await protocol.disconnect()
                         protocol = ISECNetProtocol()
