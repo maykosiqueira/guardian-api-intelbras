@@ -8,6 +8,7 @@ from app.services.auth_service import auth_service
 
 logger = logging.getLogger(__name__)
 from app.services.guardian_client import guardian_client
+from app.services.isecnet_client import isecnet_client
 from app.services.state_manager import state_manager
 from app.core.exceptions import (
     InvalidSessionError,
@@ -206,6 +207,44 @@ async def get_device(
         raise HTTPException(status_code=404, detail=str(e.message))
     except APIConnectionError as e:
         raise HTTPException(status_code=503, detail=str(e.message))
+
+
+@router.get("/{device_id}/status-probe")
+async def probe_status(
+    device_id: int,
+    cmd: str = "0x5A",
+    x_session_id: str = Header(..., alias="X-Session-ID")
+):
+    """Ask the panel one read-only status command and return the raw answer.
+
+    Diagnostics for the case where the panel refuses to arm reporting open
+    zones while the status this integration reads shows every zone closed.
+    Only read commands are accepted (see ISECNetClient.probe_status_command),
+    so nothing here can change the panel's state.
+    """
+    try:
+        access_token = await auth_service.get_valid_token(x_session_id)
+        password = await state_manager.get_device_password(
+            session_id=x_session_id, device_id=str(device_id)
+        )
+        if not password:
+            raise HTTPException(status_code=400, detail="No saved password for this device")
+
+        mac = None
+        for raw in await guardian_client.get_alarm_centrals(access_token):
+            if raw.get("id") == device_id:
+                mac = (raw.get("central_mac") or "").replace(":", "").upper()
+                break
+        if not mac:
+            raise HTTPException(status_code=404, detail="Device not found in the cloud")
+
+        ok, resultado = await isecnet_client.probe_status_command(
+            device_id=device_id, mac=mac, password=password, cmd_byte=int(cmd, 16)
+        )
+        return {"device_id": device_id, "cmd": cmd, "ok": ok, "raw": resultado,
+                "bytes": (len(resultado) // 2 if ok else 0)}
+    except InvalidSessionError as e:
+        raise HTTPException(status_code=401, detail=str(e.message))
 
 
 @router.get("/{device_id}/raw")

@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
-from app.services.isecnet_protocol import ISECNetProtocol, AlarmStatus
+from app.services.isecnet_protocol import ISECNetProtocol, AlarmStatus, ISECNetV1Command
 
 logger = logging.getLogger(__name__)
 
@@ -294,6 +294,46 @@ class ISECNetClient:
                 logger.error(f"Device {device_id} connection failed: {message}")
 
             return success, message
+
+    async def probe_status_command(
+        self,
+        device_id: int,
+        mac: str,
+        password: str,
+        cmd_byte: int,
+    ) -> Tuple[bool, str]:
+        """Send one READ command to the panel and return its raw answer as hex.
+
+        Diagnostics. The status command chosen per model (0x5A for the
+        ANM 24 Net) carries only the open-zone bitmap; a panel that refuses to
+        arm reporting open zones while that bitmap reads all zeros is talking
+        about something the bitmap does not describe, and the other status
+        commands are the only way to ask it what.
+
+        Read-only by construction: only command bytes from the read set are
+        accepted, so this cannot arm, disarm or change anything.
+        """
+        leitura = {
+            int(ISECNetV1Command.GET_PARTIAL_STATUS),
+            int(ISECNetV1Command.GET_EXTENDED_STATUS),
+            int(ISECNetV1Command.GET_SMART_STATUS),
+            int(ISECNetV1Command.GET_COMPLETE_STATUS),
+            int(ISECNetV1Command.GET_COMPLETE_INFO),
+        }
+        if cmd_byte not in leitura:
+            return False, f"0x{cmd_byte:02X} is not a read command"
+
+        ok, conn = await self._ensure_connected(device_id=device_id, mac=mac, password=password)
+        if not ok or conn is None:
+            return False, "Not connected"
+
+        async with self._get_device_lock(device_id):
+            protocol = conn.protocol
+            frame = protocol._build_isecv1_cmd([cmd_byte], password)
+            resposta = await protocol._send_and_receive(frame, timeout=8.0, retries=0)
+        if not resposta:
+            return False, "No response"
+        return True, resposta.hex()
 
     async def disconnect(self, device_id: int) -> Tuple[bool, str]:
         """
