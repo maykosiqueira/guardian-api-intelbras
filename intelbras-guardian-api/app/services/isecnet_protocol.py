@@ -1189,7 +1189,7 @@ class ISECNetProtocol:
         if not response or len(response) < 2:
             return False, "No response"
 
-        logger.debug(f"ISECNet V1 command response ({len(response)} bytes): {response.hex()}")
+        logger.info(f"ISECNet V1 command response ({len(response)} bytes): {response.hex()}")
 
         # ISECNetResponse error codes that indicate failure
         # NOTE: 0x00 is NOT included here — in status responses (46/96+ bytes),
@@ -1893,6 +1893,31 @@ class ISECNetProtocol:
                 logger.error(f"Error getting complete status: {e}")
                 return False, str(e)
 
+    async def _ler_status_sem_lock(self) -> Tuple[bool, AlarmStatus]:
+        """Le o status assumindo que o lock ja esta tomado.
+
+        `get_status()` toma `self._lock`, e `asyncio.Lock` nao e reentrante:
+        chama-lo de dentro de `arm()`, que ja o segura, travaria o processo.
+        """
+        if not self.is_authenticated:
+            return False, AlarmStatus()
+        if self._is_ip_receiver or self._is_v1:
+            cmd = self._build_isecv1_model_status_cmd(self._password, self._model_code)
+            response = await self._send_and_receive(cmd, retries=1, retry_delay=0.5)
+            if not response:
+                return False, AlarmStatus()
+            status = self._parse_isecv1_status_response(response)
+            return bool(status.is_valid), status
+        cmd = self._build_status_cmd()
+        response = await self._send_and_receive(cmd, retries=1, retry_delay=0.5)
+        if not response:
+            return False, AlarmStatus()
+        ok, _ = self._parse_command_response(response)
+        if not ok:
+            return False, AlarmStatus()
+        status = self._parse_status_response(response)
+        return bool(status.is_valid), status
+
     async def get_status(self) -> Tuple[bool, AlarmStatus]:
         """Get alarm panel status.
 
@@ -2026,8 +2051,39 @@ class ISECNetProtocol:
 
                     if success:
                         return True, f"Armed ({mode})"
-                    else:
-                        return False, f"Arm command failed: {message}"
+
+                    # Medido no hardware em 28/09/2026: esta central recusa o
+                    # arme com 0xE4 ("zona aberta") e, minutos depois, aceita o
+                    # MESMO comando com o status byte a byte identico - as 24
+                    # zonas fechadas nas duas vezes. A recusa nao descreve o
+                    # painel, e desistir nela foi o que deixou a casa sem armar
+                    # noites inteiras. Duas guardas antes de repetir: se a
+                    # central ja armou, repetir seria desarma-la; se houver zona
+                    # aberta de verdade, a recusa e legitima e insistir so
+                    # castiga a central.
+                    if "Open zones" in message:
+                        for tentativa in (1, 2):
+                            await asyncio.sleep(3)
+                            leu, atual = await self._ler_status_sem_lock()
+                            if leu and atual.is_armed:
+                                logger.info("ARM: a central ja esta armada; nao repito o comando")
+                                return True, f"Armed ({mode})"
+                            if leu and any(z.get("open", False) for z in (atual.zones or [])):
+                                logger.warning("ARM: ha zona aberta de verdade; recusa legitima")
+                                return False, f"Arm command failed: {message}"
+                            logger.info(
+                                f"ARM: recusado por 'zona aberta' com o status sem nenhuma zona "
+                                f"aberta; repetindo o comando ({tentativa}/2)"
+                            )
+                            cmd = self._build_isecv1_arm_cmd(self._password, effective_partition, stay)
+                            response = await self._send_and_receive(cmd, timeout=5.0, retries=0)
+                            if not response:
+                                continue
+                            success, message = self._parse_isecv1_command_response(response)
+                            if success:
+                                return True, f"Armed ({mode})"
+
+                    return False, f"Arm command failed: {message}"
                 else:
                     # ISECNet V2 mode (Cloud)
                     logger.debug(f"Arming using ISECNet V2, mode={mode}, partition={partition_index}")
