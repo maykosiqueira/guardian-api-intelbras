@@ -623,6 +623,16 @@ async def arm_partition(
 
         logger.info(f"Arming device {device_id} (MAC: {conn_info.mac}) via {conn_type} partition_index={partition_index} mode={request.mode} partitions_enabled={cached_partitions_enabled}")
 
+        # The session that carries an arm is always a fresh one. Measured on
+        # 2026-09-28: the panel refused twelve arms in a row with 0xE4 ("open
+        # zones") across an hour, on a session that had been open for days,
+        # with every zone closed; minutes after the add-on restarted, the same
+        # command on a newly opened session was accepted. Status reads keep
+        # working on the stale session, which is what makes this hard to see.
+        # Closing here costs about a second per arm and is paid only by the
+        # command, never by the polling.
+        await isecnet_client.disconnect(device_id)
+
         # Arm using ISECNet protocol
         success, message = await isecnet_client.arm(
             device_id=device_id,
