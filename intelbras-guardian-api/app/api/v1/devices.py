@@ -209,6 +209,50 @@ async def get_device(
         raise HTTPException(status_code=503, detail=str(e.message))
 
 
+@router.post("/{device_id}/arm-probe")
+async def probe_arm(
+    device_id: int,
+    with_partition: bool = True,
+    x_session_id: str = Header(..., alias="X-Session-ID")
+):
+    """Send one arm command in the chosen form and return the raw answer.
+
+    WARNING: this arms the panel if the panel accepts the command.
+
+    Diagnostics for a panel that refuses `A` with 0xE4 ("open zones") while
+    accepting `D` on the same session and reporting every zone closed. The
+    partition-qualified form (`A` + partition letter) is how the APK builds
+    the command when the panel has partitions, and this panel's status says
+    it does.
+    """
+    try:
+        access_token = await auth_service.get_valid_token(x_session_id)
+        password = await state_manager.get_device_password(
+            session_id=x_session_id, device_id=str(device_id)
+        )
+        if not password:
+            raise HTTPException(status_code=400, detail="No saved password for this device")
+
+        mac = None
+        for raw in await guardian_client.get_alarm_centrals(access_token):
+            if raw.get("id") == device_id:
+                mac = (raw.get("central_mac") or "").replace(":", "").upper()
+                break
+        if not mac:
+            raise HTTPException(status_code=404, detail="Device not found in the cloud")
+
+        ok, resultado = await isecnet_client.probe_arm_variant(
+            device_id=device_id, mac=mac, password=password, with_partition=with_partition
+        )
+        codigo = None
+        if ok and len(resultado) >= 6:
+            codigo = "0x" + resultado[4:6].upper()
+        return {"device_id": device_id, "with_partition": with_partition,
+                "ok": ok, "raw": resultado, "code": codigo}
+    except InvalidSessionError as e:
+        raise HTTPException(status_code=401, detail=str(e.message))
+
+
 @router.get("/{device_id}/status-probe")
 async def probe_status(
     device_id: int,

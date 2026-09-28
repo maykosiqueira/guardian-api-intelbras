@@ -335,6 +335,43 @@ class ISECNetClient:
             return False, "No response"
         return True, resposta.hex()
 
+    async def probe_arm_variant(
+        self,
+        device_id: int,
+        mac: str,
+        password: str,
+        with_partition: bool,
+    ) -> Tuple[bool, str]:
+        """Send one arm command and return the panel's raw answer as hex.
+
+        The panel refuses `A` (arm, no partition letter) with 0xE4 while
+        accepting `D` (disarm) on the same session, and its status reports
+        `partitions_enabled = 1`. The APK builds the arm command as `A`
+        followed by the partition letter (A=0x41 for index 0), so the
+        partition-qualified form is a documented variant, not a guess — and
+        it is the only difference between the command that works and the one
+        that does not.
+
+        This ARMS the panel if the variant is accepted. It exists to answer
+        which form the panel takes, and is called only from the diagnostics
+        route.
+        """
+        ok, conn = await self._ensure_connected(device_id=device_id, mac=mac, password=password)
+        if not ok or conn is None:
+            return False, "Not connected"
+
+        comando = [int(ISECNetV1Command.ACTIVATE_CENTRAL)]
+        if with_partition:
+            comando.append(0x41)  # partition index 0 -> letter 'A'
+
+        async with self._get_device_lock(device_id):
+            protocol = conn.protocol
+            frame = protocol._build_isecv1_cmd(comando, password)
+            resposta = await protocol._send_and_receive(frame, timeout=8.0, retries=0)
+        if not resposta:
+            return False, "No response"
+        return True, resposta.hex()
+
     async def disconnect(self, device_id: int) -> Tuple[bool, str]:
         """
         Disconnect from an alarm panel.
