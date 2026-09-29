@@ -124,6 +124,46 @@ def _parse_device(raw: dict, has_saved_password: bool = False, partitions_enable
     )
 
 
+@router.get("/cloud-probe")
+async def cloud_probe(
+    path: str,
+    method: str = "GET",
+    x_session_id: str = Header(..., alias="X-Session-ID")
+):
+    """Ask the Guardian cloud whether a path exists, without acting on it.
+
+    Finding the endpoint the phone app uses to arm cannot be done by sending
+    candidate commands at a live alarm panel. It can be done by asking: a path
+    that exists but needs POST answers 405, one that does not exist answers
+    404. Only GET, HEAD and OPTIONS are allowed through here, so the probe
+    cannot arm, disarm or change anything.
+    """
+    seguros = {"GET", "HEAD", "OPTIONS"}
+    metodo = method.upper()
+    if metodo not in seguros:
+        raise HTTPException(status_code=400, detail=f"{metodo} is not a read-only method")
+    if not path.startswith("/"):
+        raise HTTPException(status_code=400, detail="path must start with /")
+
+    import aiohttp
+    from app.core.config import settings as _settings
+    try:
+        access_token = await auth_service.get_valid_token(x_session_id)
+        url = f"{_settings.INTELBRAS_API_URL}{path}"
+        async with aiohttp.ClientSession() as sessao:
+            async with sessao.request(
+                metodo, url,
+                headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                corpo = (await resp.text())[:400]
+                permitido = resp.headers.get("Allow") or resp.headers.get("allow")
+                return {"path": path, "method": metodo, "status": resp.status,
+                        "allow": permitido, "body": corpo}
+    except InvalidSessionError as e:
+        raise HTTPException(status_code=401, detail=str(e.message))
+
+
 @router.get("", response_model=DeviceListResponse)
 async def list_devices(x_session_id: str = Header(..., alias="X-Session-ID")):
     """
@@ -207,46 +247,6 @@ async def get_device(
         raise HTTPException(status_code=404, detail=str(e.message))
     except APIConnectionError as e:
         raise HTTPException(status_code=503, detail=str(e.message))
-
-
-@router.get("/cloud-probe")
-async def cloud_probe(
-    path: str,
-    method: str = "GET",
-    x_session_id: str = Header(..., alias="X-Session-ID")
-):
-    """Ask the Guardian cloud whether a path exists, without acting on it.
-
-    Finding the endpoint the phone app uses to arm cannot be done by sending
-    candidate commands at a live alarm panel. It can be done by asking: a path
-    that exists but needs POST answers 405, one that does not exist answers
-    404. Only GET, HEAD and OPTIONS are allowed through here, so the probe
-    cannot arm, disarm or change anything.
-    """
-    seguros = {"GET", "HEAD", "OPTIONS"}
-    metodo = method.upper()
-    if metodo not in seguros:
-        raise HTTPException(status_code=400, detail=f"{metodo} is not a read-only method")
-    if not path.startswith("/"):
-        raise HTTPException(status_code=400, detail="path must start with /")
-
-    import aiohttp
-    from app.core.config import settings as _settings
-    try:
-        access_token = await auth_service.get_valid_token(x_session_id)
-        url = f"{_settings.INTELBRAS_API_URL}{path}"
-        async with aiohttp.ClientSession() as sessao:
-            async with sessao.request(
-                metodo, url,
-                headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                corpo = (await resp.text())[:400]
-                permitido = resp.headers.get("Allow") or resp.headers.get("allow")
-                return {"path": path, "method": metodo, "status": resp.status,
-                        "allow": permitido, "body": corpo}
-    except InvalidSessionError as e:
-        raise HTTPException(status_code=401, detail=str(e.message))
 
 
 @router.post("/{device_id}/arm-probe")
